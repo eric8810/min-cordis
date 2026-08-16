@@ -76,10 +76,15 @@ These are core-design positions, not bugs — kept identical to upstream:
 ## Run
 
 ```sh
-npm test        # node --import tsx --test "test/*.test.ts"
+npm test
 ```
 
-Node >= 22.19 (TypeScript is executed directly through `tsx`; the package ships `src/` as its export).
+Two suites:
+
+- `tests/*.spec.ts` — the upstream Cordis core test suite (11 spec files, 62 tests: fiber/inertia, events, reflect, isolate, shadow/caller tracing, invoke, service, plugin, decorator, dispose, associate), ported with only import-path changes. One upstream test asserting the full logger's buffer was adapted to the minimal logger's `errors` ring; `logger.spec.ts` itself is not ported (the full logger is not part of min-cordis).
+- `test/core.test.ts` — regression tests written for each audit fix above.
+
+Node >= 22.19 (TypeScript is executed directly through `tsx`; the package ships `src/` as its export). Tests use vitest 3 — the upstream `Inject` decorator targets Stage-3 native decorators, so `experimentalDecorators` must stay off.
 
 ## Provenance
 

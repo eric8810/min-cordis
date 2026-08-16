@@ -15,9 +15,10 @@
   },
   "sideEffects": false,
   "scripts": {
-    "test": "node --import tsx --test \"test/*.test.ts\""
+    "test": "vitest run && node --import tsx --test \"test/*.test.ts\""
   },
   "devDependencies": {
-    "tsx": "^4.20.0"
+    "tsx": "^4.20.0",
+    "vitest": "^3.2.7"
   }
 }

@@ -49,6 +49,9 @@ export class Logger {
  * framework containment paths.
  */
 export class LoggerService extends Service {
+  /** Contained error calls routed through this service (test/diagnostic ring). */
+  readonly errors: unknown[][] = []
+
   constructor(ctx: Context) {
     super(ctx, 'logger')
     // noShadow: the service is identity-aware (derives names from callers),
@@ -69,5 +72,8 @@ export class LoggerService extends Service {
   info(...args: any[]) { this[Service.invoke]().info(...args) }
   success(...args: any[]) { this[Service.invoke]().success(...args) }
   warn(...args: any[]) { this[Service.invoke]().warn(...args) }
-  error(...args: any[]) { this[Service.invoke]().error(...args) }
+  error(...args: any[]) {
+    this.errors.push(args)
+    this[Service.invoke]().error(...args)
+  }
 }
