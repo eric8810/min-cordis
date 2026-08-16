@@ -243,12 +243,7 @@ class _TraceableView(_DunderMixin):
         binding = self._binding
         dotted = f"{tracker.associate}.{name}" if tracker.associate else None
         if dotted is not None and dotted in binding.root.reflect.props:
-            value = binding._resolve_walk(dotted)
-            if isinstance(value, types.FunctionType):
-                # JS method-call syntax passes the receiver as `this`; bind
-                # the resolved function to this view for parity.
-                return _function_wrapper(value, self, binding)
-            return value
+            return binding._resolve_dotted(dotted, self)
 
         kind, member = _find_class_member(self._target, name)
         if kind == "instance":
@@ -280,7 +275,11 @@ class _TraceableView(_DunderMixin):
         binding = self._binding
         dotted = f"{tracker.associate}.{name}" if tracker.associate else None
         if dotted is not None and dotted in binding.root.reflect.props:
-            binding.root.reflect.set(dotted, value, ctx=binding)
+            defn = binding.root.reflect.props[dotted]
+            if isinstance(defn, dict) and defn.get("type") == "accessor":
+                binding._resolve_dotted_set(dotted, value, self)
+            else:
+                binding.root.reflect.set(dotted, value, ctx=binding)
             return
         self._set_on_target(name, value)
 
@@ -380,12 +379,10 @@ class _Overlay(_DunderMixin):
         tracker = self._tracker_of()
         target = self._root_target()
         binding = self._binding_of()
+        tracker = self._tracker_of()
         dotted = f"{tracker.associate}.{name}" if (tracker is not None and tracker.associate) else None
         if dotted is not None and binding is not None and dotted in binding.root.reflect.props:
-            value = binding._resolve_walk(dotted)
-            if isinstance(value, types.FunctionType):
-                return _function_wrapper(value, self, binding)
-            return value
+            return binding._resolve_dotted(dotted, self)
         kind, member = _find_class_member(target, name)
         if kind == "instance":
             if isinstance(member, types.FunctionType) and tracker is not None and not tracker.no_shadow:
@@ -480,10 +477,7 @@ class _DerivedService(_DunderMixin):
         tracker = getattr(target, TRACKER, None)
         dotted = f"{tracker.associate}.{name}" if (tracker is not None and tracker.associate) else None
         if dotted is not None and binding is not None and dotted in binding.root.reflect.props:
-            value = binding._resolve_walk(dotted)
-            if isinstance(value, types.FunctionType):
-                return _function_wrapper(value, self, binding)
-            return value
+            return binding._resolve_dotted(dotted, self)
         kind, member = _find_class_member(target, name)
         if kind == "instance":
             return member

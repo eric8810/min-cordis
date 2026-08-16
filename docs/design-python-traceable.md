@@ -89,3 +89,20 @@ caller 语义的本质是"**绑定随引用走,不随动态作用域走**"——
 时序注记:TS 的微任务语义让 `await plugin(...)` 顺带排干 notify 触发的依赖重载;Python 的 ensure_future 链需要额外 loop tick,涉及"provider 加载后断言消费者已跑"的测试补了 `await asyncio.sleep(0.05)`(Windows 下 `asyncio.wait` 定时器粒度 ~15ms)。
 
 未移植(顺延):`ctx.accessor`/`ctx.mixin`(associate.spec #3/#4)、`internal/get`/`internal/set` 瀑布钩子、R3(registry.delete fire-and-forget,service.spec #4 快照对账测试依赖它)。
+
+## 七、补完记录(同日第二轮,accessor/mixin + 审计遗留项)
+
+交付:`ctx.accessor`/`ctx.mixin`(字符串源忠实;`_MixinBind` 复刻 `withProps(receiver, service)` 的服务优先绑定)、associate #3 移植、invoke #2(callable 扩展用影子)移植、C4/C5 修复、R3 验证。测试 37 → 43。
+
+关键实证(探针,非推演):
+
+1. **associate.spec #4 内层是死代码**:`ctx.inject(['bar'])` 等的服务从未被提供,内层断言空转;唯一活断言是外层「对象源 mixin 读抛 `cannot get property "[object Object]" without inject`」。Python 复刻该解析怪癖:插件 ctx 读抛错、root ctx 读返回 None;内层不移植。
+2. **dict 形式 mixin 的映射方向是 `{service 成员名 → ctx 属性名}`**(数组形式同名)。
+
+本轮修复:
+
+- **祖先链 inject 可见性**:TS 属性读沿 fiber 父链走(associate #3 的 inner 只注入 `bar` 仍可读祖先注入的 `foo`)。Python 原实现每层替换 `_inject_requested`,丢了祖先可见性 → `_effective_inject` 改为 own ∪ 祖先并集,收紧哲学不变(整条链都没声明的名字照旧报错)。
+- **C4**:store 键从 `id(label)` 改为 label 对象本身(身份哈希),id 复用不可能再合并两个作用域。改名时 unregister 闭包漏改引发 NameError 被 sink 吞掉、store 残留——教训:contained error 会让注册表损坏静默化,排障先看 sink。
+- **C5**:`__setattr__` 对非核心名、非下划线名路由 `reflect.set`(插件 ctx 必须同 fiber provide 过;root ctx 保持宽松直写,对齐 TS set trap 分支)。
+- **R3**:维持 fire-and-forget(TS registry.delete 同样不等待),`test_compare_snapshot` 用 sleep 排水后对账快照,与上游测试形态一致。
+- dotted 服务值为裸函数时绑定读视图(`ctx.foo.baz()` 的 JS 隐式 this 对应物),重构时曾丢失、property-injection 测试抓回。

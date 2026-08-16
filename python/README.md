@@ -62,6 +62,9 @@ Rules ported from the TS core:
   the real consumer scope (upstream shadow.spec).
 - **`Tracker`** objects (`_tracker` attribute) drive wrapping; `no_shadow=True`
   marks identity-aware services.
+- **`ctx.accessor(name, {get, set})` / `ctx.mixin(source, mixins)`** define
+  computed context properties; mixin methods bind to a service-overlaid
+  receiver so associated reads keep their shadow context.
 
 Intentional deviations (documented in [docs/design-python-traceable.md](../docs/design-python-traceable.md)):
 
@@ -76,16 +79,28 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
 
 ## Not yet ported
 
-- `ctx.accessor` / `ctx.mixin` (computed context properties and method
-  forwarding; associate.spec #3/#4 need them)
-- `internal/get` / `internal/set` waterfall hooks
-- `registry.delete` is still fire-and-forget (R3)
+- `internal/get` / `internal/set` waterfall hooks (extension points around
+  service resolution; the resolution itself is ported)
 - logger service (the error sink is a callable)
+
+## Verified parity notes
+
+- `registry.delete` is fire-and-forget, exactly like the TS registry (the
+  upstream snapshot test drains it with `sleep()`); covered by
+  `test_compare_snapshot`.
+- Object-source `ctx.mixin(instance, ...)` reproduces the upstream
+  resolution quirk: plugin-context reads raise `cannot get property ...
+  without inject`; root-context reads resolve to None. The upstream
+  associate.spec #4 inner block is dead code (waits for a never-provided
+  service; verified by probe) and is not ported.
+- Attribute reads require an inject declared **somewhere on the context
+  ancestor chain** (own ∪ ancestors), mirroring the TS fiber-chain walk;
+  names nobody declared still fail loudly (`ctx.get` is the escape hatch).
 
 ## Run tests
 
 ```sh
 uv sync
-uv run pytest -q                    # 37 tests
+uv run pytest -q                    # 43 tests
 uv run pytest -q -W error::RuntimeWarning
 ```

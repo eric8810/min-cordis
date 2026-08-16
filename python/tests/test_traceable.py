@@ -17,6 +17,8 @@ docs/design-python-traceable.md):
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from min_cordis import Context, Service, Tracker
@@ -220,6 +222,47 @@ class TestFunctionalService:
         assert foo1.invoke() == {"a": 1, "b": 2}
         assert errors == []
 
+    async def test_uses_service_shadow_for_callable_extensions(self, root):
+        class Dependency(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "dependency")
+
+        class Callable(Service):
+            inject = ["dependency"]
+
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "callable")
+
+            def _invoke(self):
+                return self.ctx.dependency
+
+            def extend(self):
+                return self._extend()
+
+        class Outer(Service):
+            inject = ["callable"]
+
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "outer")
+
+            def call(self):
+                callable_ = self.ctx.callable
+                return [callable_(), callable_.extend()()]
+
+        await root.plugin(Dependency)
+        await root.plugin(Callable)
+        await root.plugin(Outer)
+
+        result: list = []
+
+        def consumer(ctx, config):
+            result.extend(ctx.outer.call())
+
+        await root.inject_plugins(["outer"], consumer)
+
+        assert len(result) == 2
+        assert all(isinstance(item, Dependency) for item in result)
+
 
 class TestAssociation:
     async def test_service_injection(self, root):
@@ -296,3 +339,90 @@ class TestAssociation:
 
         root.get("foo").bar(X)
         assert checks == [True, True]
+
+    async def test_associated_type_service_injection(self, root):
+        class Session:
+            _tracker = Tracker(property="ctx", associate="session")
+
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+        class Foo(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "foo")
+
+            def create_session(self):
+                return Session(self.ctx)
+
+        class Bar(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "bar")
+                ctx.mixin("bar", {"answer": "session.answer"})
+
+            def answer(self):
+                return 42
+
+        await root.plugin(Foo)
+
+        async def scope(ctx, config):
+            session = ctx.foo.create_session()
+            assert isinstance(session, Session)
+            # no 'session.answer' accessor yet: TS reads undefined, Python
+            # raises AttributeError (documented deviation)
+            assert getattr(session, "answer", None) is None
+
+            await ctx.plugin(Bar)
+            await asyncio.sleep(0.05)
+
+            def inner(ctx2, config2):
+                session2 = ctx2.foo.create_session()
+                assert isinstance(session2, Session)
+                assert session2.answer() == 42
+
+            await ctx.inject_plugins(["bar"], inner)
+
+        await root.inject_plugins(["foo"], scope)
+
+    async def test_associated_type_object_source_matches_upstream(self, root):
+        # Upstream associate.spec #4: the inner `ctx.inject(['bar'], ...)`
+        # block waits for a service that is never provided — it is dead code
+        # (verified by probe against the TS suite). The asserted behavior is
+        # the outer read: an object-source mixin target is not a valid
+        # context property, so plugin-context reads raise.
+        class Session:
+            _tracker = Tracker(property="ctx", associate="session")
+
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+        class Foo(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "foo")
+
+            def session(self):
+                return Session(self.ctx)
+
+        class Bar:
+            def __init__(self, ctx, config=None):
+                ctx.mixin(self, {"bar": "session.bar"})
+
+            @property
+            def bar(self):
+                return getattr(self, "_secret", None)
+
+            @bar.setter
+            def bar(self, value):
+                self._secret = value + 1
+
+        await root.plugin(Foo)
+        await root.plugin(Bar)
+
+        # root-context read (no runtime): TS lenient lookup resolves undefined
+        assert root.get("foo").session().bar is None
+
+        async def scope(ctx, config):
+            session = ctx.foo.session()
+            with pytest.raises(RuntimeError, match="without inject"):
+                _ = session.bar
+
+        await root.inject_plugins(["foo"], scope)

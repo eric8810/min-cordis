@@ -168,6 +168,27 @@ async def test_multiple_injects(root):
     assert calls == {"foo": 1, "bar": 1, "qux": 1}
 
 
+async def test_compare_snapshot(root):
+    """service.spec #4: registry.delete leaves no residual event hooks."""
+    class Test(Service):
+        def __init__(self, ctx, config=None):
+            super().__init__(ctx, "test")
+            ctx.inject_plugins(["test"], lambda c, cfg: None)
+
+    def snapshot():
+        return {name: len(hooks) for name, hooks in root.events._hooks.items() if hooks}
+
+    before = snapshot()
+    await root.plugin(Test)
+    after = snapshot()
+    root.registry.delete(Test)
+    # registry.delete is fire-and-forget (TS parity); drain the disposal
+    await asyncio.sleep(0.05)
+    assert snapshot() == before
+    await root.plugin(Test)
+    assert snapshot() == after
+
+
 class TestInjectDecorator:
     async def test_on_class_method(self, root):
         calls: list = []

@@ -202,3 +202,68 @@ async def test_inertia_chain_on_dependency_flap(ctx):
 
     await consumer.dispose()
     await p2.dispose()
+
+
+async def test_c4_isolate_labels_key_store_by_object(ctx):
+    """Audit C4: the store is keyed by the label object, not id().
+
+    An id can be reused after garbage collection, silently merging two
+    isolation scopes. Keying by the object keeps entries alive-referenced
+    and distinct across scope churn.
+    """
+    import gc
+
+    iso = ctx.isolate("svc")
+    view = iso.plugin(lambda c, cfg: c.provide("svc", "scoped"))
+    await view
+    assert iso.get("svc") == "scoped"
+
+    await view.dispose()
+    await asyncio.sleep(0.05)
+    gc.collect()
+    assert all(impl["name"] != "svc" for impl in ctx.reflect.store.values())
+
+    # a fresh scope under the same name is fully independent
+    iso2 = ctx.isolate("svc")
+    view2 = iso2.plugin(lambda c, cfg: c.provide("svc", "scoped2"))
+    await view2
+    assert iso2.get("svc") == "scoped2"
+    assert ctx.get("svc") is None
+    await view2.dispose()
+
+
+async def test_c5_ctx_setattr_cannot_bypass_write_validation(ctx):
+    """Audit C5: attribute writes on a plugin context route through reflect.set.
+
+    Plain writes would shadow the service-resolution path; the TS proxy set
+    trap requires the name to be provided by the same fiber.
+    """
+    # root context (no runtime): plain writes allowed, mirroring the TS
+    # lenient root branch
+    ctx.custom = 1
+    assert ctx.custom == 1
+
+    def plugin(c, cfg):
+        with pytest.raises(RuntimeError, match="cannot set property"):
+            c.custom2 = 2
+
+    view = ctx.plugin(plugin)
+    await view
+
+    def provider(c, cfg):
+        dispose = c.provide("svc", 1)
+        # attribute write on the providing fiber routes through reflect.set
+        c.svc = 5
+        # strict lookups skip non-ACTIVE fibers (still loading here)
+        assert c.get("svc", strict=False) == 5
+        return dispose
+
+    view2 = ctx.plugin(provider)
+    await view2
+
+    # a foreign fiber cannot overwrite the provided value
+    with pytest.raises(RuntimeError, match="cannot set property"):
+        ctx.set("svc", 9)
+    assert ctx.get("svc") == 5
+
+    await view2.dispose()
