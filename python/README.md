@@ -20,6 +20,7 @@ Ported from the trimmed TypeScript core ([../README.md](../README.md)), itself d
 | `joinPrototype(Service, Function)` callables | any object with `_invoke` + `__call__` dispatch |
 | `Service[symbols.init/check/invoke/extend]` | `_init` / `_check` / `_invoke` / `_extend` hook attributes |
 | `@Inject` decorators | `Inject(name, config)` on classes and service methods |
+| `internal/get`/`internal/set` waterfalls | same names through `Events.waterfall` |
 
 Baked-in audit fixes (same as the TS core): emit containment for async listener rejections, per-callback `internal/status` containment, `update()` validates before storing, lifecycle calls re-anchor to `ctx.fiber`.
 
@@ -65,6 +66,9 @@ Rules ported from the TS core:
 - **`ctx.accessor(name, {get, set})` / `ctx.mixin(source, mixins)`** define
   computed context properties; mixin methods bind to a service-overlaid
   receiver so associated reads keep their shadow context.
+- **Logger service**: `ctx.logger('name')` → named logger, `MIN_CORDIS_LOG`
+  threshold, bounded `errors` ring; `internal/get`/`internal/set` waterfalls
+  wrap service resolution on plugin contexts.
 
 Intentional deviations (documented in [docs/design-python-traceable.md](../docs/design-python-traceable.md)):
 
@@ -77,14 +81,17 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
   lookups, and it also fixes labels interned on the root map after a plugin
   context was created.
 
-## Not yet ported
+## Parity notes
 
-- `internal/get` / `internal/set` waterfall hooks (extension points around
-  service resolution; the resolution itself is ported)
-- logger service (the error sink is a callable)
-
-## Verified parity notes
-
+- **Logger service**: `ctx.logger('name')` returns a level-filtered `Logger`
+  (`MIN_CORDIS_LOG` threshold); `ctx.logger.error(...)` records into a bounded
+  ring. Error containment still routes to the injected `on_error` sink — the
+  logger is the user-facing surface, the sink is the diagnostics surface.
+- **`internal/get` / `internal/set` waterfalls**: service reads on plugin
+  contexts and attribute writes dispatch through the event bus before
+  resolution; listeners may intercept (return a value / short-circuit) or
+  delegate via `next()`. Root-context reads stay outside the get waterfall
+  (TS parity).
 - `registry.delete` is fire-and-forget, exactly like the TS registry (the
   upstream snapshot test drains it with `sleep()`); covered by
   `test_compare_snapshot`.
@@ -101,6 +108,6 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
 
 ```sh
 uv sync
-uv run pytest -q                    # 43 tests
+uv run pytest -q                    # 48 tests
 uv run pytest -q -W error::RuntimeWarning
 ```

@@ -90,6 +90,8 @@ caller 语义的本质是"**绑定随引用走,不随动态作用域走**"——
 
 未移植(顺延):`ctx.accessor`/`ctx.mixin`(associate.spec #3/#4)、`internal/get`/`internal/set` 瀑布钩子、R3(registry.delete fire-and-forget,service.spec #4 快照对账测试依赖它)。
 
+> 注:上段及下文第七节所列的「未移植」项已在后续两轮全部落地(accessor/mixin、瀑布钩子、logger、C4/C5/R3 清零);保留原文以记录当时的裁决脉络。
+
 ## 七、补完记录(同日第二轮,accessor/mixin + 审计遗留项)
 
 交付:`ctx.accessor`/`ctx.mixin`(字符串源忠实;`_MixinBind` 复刻 `withProps(receiver, service)` 的服务优先绑定)、associate #3 移植、invoke #2(callable 扩展用影子)移植、C4/C5 修复、R3 验证。测试 37 → 43。
@@ -106,3 +108,9 @@ caller 语义的本质是"**绑定随引用走,不随动态作用域走**"——
 - **C5**:`__setattr__` 对非核心名、非下划线名路由 `reflect.set`(插件 ctx 必须同 fiber provide 过;root ctx 保持宽松直写,对齐 TS set trap 分支)。
 - **R3**:维持 fire-and-forget(TS registry.delete 同样不等待),`test_compare_snapshot` 用 sleep 排水后对账快照,与上游测试形态一致。
 - dotted 服务值为裸函数时绑定读视图(`ctx.foo.baz()` 的 JS 隐式 this 对应物),重构时曾丢失、property-injection 测试抓回。
+
+## 八、收官轮(同日第三轮:logger + internal/get/set 瀑布)
+
+- `_logger.py`:`Logger`(MIN_CORDIS_LOG 阈值,error/warn→stderr)+ `LoggerService`(callable `_invoke`、errors 环形缓冲 1000 上限、tracker `{associate: 'logger', no_shadow: True}`,构造后覆写)。安装于 `Context.__init__`,`ctx.logger` 存 traceable 视图。**双面设计**:错误遏制继续走注入的 `on_error` sink(诊断面),logger 是用户面——不互串,测试可确定性断言。
+- `internal/get` 瀑布:包住插件 ctx 的服务读(`__getattr__` fallback)与 `_resolve_walk` 的 walk 循环;root 宽松读在瀑布外(TS 同层)。`internal/set` 瀑布:包住 `__setattr__` 的 reflect.set 路径。listener 签名 `(ctx, name, [value,] error, next)`。
+- 坑:`Events.waterfall` 的 inner 会以 listener 参数调用 fallback——fallback 必须收 `*_`(与 TS 箭头函数无参不同);`ctx.on` 的 disposer 返回协程要 await。

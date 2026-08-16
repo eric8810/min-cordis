@@ -13,7 +13,7 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 ├── src\          TS 版:context/reflect/fiber/events/registry/service/utils/logger/index(9 文件)
 ├── tests\        上游 Cordis 测试套件(11 spec / 62 tests,来自 cordis-workspace HEAD)
 ├── test\         自写审计回归(10 tests)
-├── python\       Python 3.11+ 移植(min_cordis\ 8 模块 + tests\ 43 tests)
+├── python\       Python 3.11+ 移植(min_cordis\ 8 模块 + tests\ 48 tests)
 └── docs\         两份等价性审计报告(见下)
 ```
 
@@ -39,15 +39,16 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 - 相对 vendored 原版带 7 项修复 + 2 个上游 cherry-pick(be7d36e callable shadow、8abd903 symbols.caller)
 - 测试:62 上游 + 10 回归全绿
 
-### Python 版:✅ 与 TS 核心语义对齐,能力边界明确
+### Python 版:✅ 与 TS 核心全面对齐(收官)
 
 - deepseek-v4-pro 审计发现的 7 项严重/高危偏离**已全部修复**([docs/audit-python-parity-2026-08-16.md](audit-python-parity-2026-08-16.md)),每项带回归测试
 - **Service 基类 + `@Inject` + traceable/caller/shadow 已落地**([docs/design-python-traceable.md](design-python-traceable.md),含实现记录):`_service.py`(Service/Inject/resolveConfig)、`_traceable.py`(访问期绑定视图)、C1–C5 契约全带测试
-- **accessor/mixin 已落地**:`ctx.accessor`/`ctx.mixin`(字符串源忠实;对象源复刻上游解析怪癖,见 README「Verified parity notes」),associate.spec #3 移植、#4 经探针证实内层为死代码只移植外层
+- **accessor/mixin 已落地**:`ctx.accessor`/`ctx.mixin`(字符串源忠实;对象源复刻上游解析怪癖,见 README「Parity notes」),associate.spec #3 移植、#4 经探针证实内层为死代码只移植外层
+- **logger 服务已落地**(`_logger.py`):`ctx.logger('name')` 级别过滤 + errors 环形缓冲;错误遏制仍走注入的 `on_error` sink(双面设计:logger 面向用户,sink 面向诊断)
+- **`internal/get`/`internal/set` 瀑布钩子已落地**:插件 ctx 的服务读与属性写经事件总线分发,监听可拦截或 `next()` 透传;root 读不走 get 瀑布(TS 同)
 - **审计遗留项清零**:C4(store 改按 label 对象为键)、C5(`__setattr__` 路由 reflect.set 校验)已修;R3(delete fire-and-forget)经 test_compare_snapshot 验证与 TS 一致
 - 顺带修复:intercept 原型链语义、inject-config→intercept 条目、`_label_for` 死链、**祖先链 inject 可见性**(TS fiber 链 walk 的对应物:own ∪ 祖先 `_inject_requested`)
-- 测试 19 → **43**(`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1
-- **未移植的层**(README 已声明):`internal/get`/`internal/set` 瀑布钩子(扩展点,解析本身已移植)、logger 服务
+- 测试 19 → **48**(`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1
 
 ## 怎么跑
 
@@ -60,7 +61,7 @@ npm test                              # 两者都跑
 
 # Python(uv 管理,环境已 sync)
 cd C:\Users\eric8810\repos\min-cordis\python
-uv run pytest -q                      # 43 tests
+uv run pytest -q                      # 48 tests
 ```
 
 注意:上游 `Inject` 装饰器是 Stage-3 原生装饰器,`experimentalDecorators` 必须**关闭**(vitest 3 + esbuild,不能用 vitest 4 的 oxc)。
@@ -74,11 +75,10 @@ uv run pytest -q                      # 43 tests
 
 ## 下一步(按价值排)
 
-核心移植已完结:Service/@Inject/traceable、accessor/mixin、上游 spec 等价(shadow 4/4、invoke 2/2、associate 4/5、service 5/5、decorator 1/1)、C4/C5/R3 全部清零。剩余都是可选项:
+核心移植**全部完结**:Service/@Inject/traceable、accessor/mixin、logger、`internal/get`/`internal/set` 瀑布钩子、上游 spec 等价(shadow 4/4、invoke 2/2、associate 4/5、service 5/5、decorator 1/1)、C4/C5/R3 全部清零。剩余是可选延伸:
 
-1. `internal/get`/`internal/set` 瀑布钩子(扩展点;解析本身已移植)
-2. logger 服务(现在 error sink 是个 callable)
-3. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
+1. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
+2. 若上游 cordis 有新 commit 值得跟进,以 cordis-workspace 对照 cherry-pick
 
 ## 会话历史摘要(需要细节时查)
 

@@ -1,4 +1,4 @@
-"""Context: scoped dependency container with attribute-style service reads.
+﻿"""Context: scoped dependency container with attribute-style service reads.
 
 The JS Proxy becomes ``__getattr__``/``__setattr__`` checks: reading an
 undeclared name requires it to be injected (or fails loudly), writing
@@ -359,6 +359,7 @@ class Context:
         self._inject_requested: set[str] = set()
 
         from ._registry import Registry
+        from ._logger import LoggerService
         self.events = Events(self)
         self.reflect = ReflectService(self)
         self.registry = Registry(self)
@@ -372,6 +373,11 @@ class Context:
             registry=self.registry,
             on_error=self.on_error,
         )
+
+        # Built-in logger service (TS installs LoggerService on the root
+        # fiber). Stored as its traceable view so ``ctx.logger('name')`` is
+        # callable through the service invoke body.
+        self.logger = get_traceable(self, LoggerService(self))
 
     # ---------------------------------------------------------------- fiber
 
@@ -451,12 +457,27 @@ class Context:
             return defn["get"](self, None)
         if getattr(self, SHADOW, None) is not None:
             return self._resolve_walk(name)
-        if name not in self._effective_inject():
-            raise RuntimeError(f'cannot get property "{name}" without inject')
-        value = self.reflect.get(name, strict=True, ctx=self)
-        if value is None:
-            raise RuntimeError(f'cannot get required service "{name}" in inactive context')
-        return value
+        if self.fiber.runtime is None:
+            # TS resolves root-context reads leniently without the
+            # internal/get waterfall; the Python port keeps the tightened
+            # error instead.
+            if name not in self._effective_inject():
+                raise RuntimeError(f'cannot get property "{name}" without inject')
+            value = self.reflect.get(name, strict=True, ctx=self)
+            if value is None:
+                raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+            return value
+
+        def fallback(*_: Any) -> Any:
+            if name not in self._effective_inject():
+                raise RuntimeError(f'cannot get property "{name}" without inject')
+            value = self.reflect.get(name, strict=True, ctx=self)
+            if value is None:
+                raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+            return value
+
+        error = RuntimeError(f'cannot get property "{name}" without inject')
+        return self.events.waterfall("internal/get", self, name, error, fallback)
 
     def _resolve_dotted(self, name: str, receiver: Any) -> Any:
         """Associated (dotted) resolution for traceable views.
@@ -490,25 +511,33 @@ class Context:
 
         Starts at the shadow provider's fiber (or the reading fiber), finds
         the nearest store entry, and stops at root or at an isolation
-        boundary. Root-context reads stay lenient (non-strict lookup).
+        boundary. Root-context reads stay lenient (non-strict lookup). The
+        walk itself runs inside the ``internal/get`` waterfall, so listeners
+        may intercept or synthesize service reads (TS parity).
         """
         marker = getattr(self, SHADOW, None)
         start = marker if marker is not None else self
         fiber = start.fiber
         if marker is None and fiber.runtime is None:
             return self.reflect.get(name, strict=False, ctx=self)
-        root_label = self.root._isolate.get(name)
-        while True:
-            impl = fiber.store.get(name) if fiber.store else None
-            if impl is not None:
-                return get_traceable(self, impl["value"])
-            if name in fiber.inject:
-                raise RuntimeError(f'cannot get required service "{name}" in inactive context')
-            if fiber.runtime is None:
-                raise RuntimeError(f'cannot get property "{name}" without inject')
-            if _label_object(fiber.parent, name) is not root_label:
-                raise RuntimeError(f'cannot get property "{name}" without inject')
-            fiber = fiber.parent.fiber
+
+        def fallback(*_: Any) -> Any:
+            root_label = self.root._isolate.get(name)
+            walk = fiber
+            while True:
+                impl = walk.store.get(name) if walk.store else None
+                if impl is not None:
+                    return get_traceable(self, impl["value"])
+                if name in walk.inject:
+                    raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+                if walk.runtime is None:
+                    raise RuntimeError(f'cannot get property "{name}" without inject')
+                if _label_object(walk.parent, name) is not root_label:
+                    raise RuntimeError(f'cannot get property "{name}" without inject')
+                walk = walk.parent.fiber
+
+        error = RuntimeError(f'cannot get property "{name}" without inject')
+        return self.events.waterfall("internal/get", self, name, error, fallback)
 
     def _effective_inject(self) -> set[str]:
         """Names readable on this context: own injects plus every ancestor's.
@@ -538,12 +567,19 @@ class Context:
             return
         stripped = self._stripped()
         # TS parity: the root context (no runtime) accepts plain writes;
-        # plugin contexts must go through reflect.set, which requires the
-        # name to have been provided by the same fiber (audit item C5).
-        if stripped.fiber.runtime is None:
+        # plugin contexts go through the internal/set waterfall into
+        # reflect.set, which requires the name to have been provided by the
+        # same fiber (audit item C5).
+        if self.fiber.runtime is None:
             object.__setattr__(self, name, value)
             return
-        self.reflect.set(name, value, ctx=stripped)
+
+        def fallback(*_: Any) -> Any:
+            self.reflect.set(name, value, ctx=stripped)
+            return True
+
+        error = RuntimeError(f'cannot set property "{name}" without provide')
+        self.events.waterfall("internal/set", stripped, name, value, error, fallback)
 
     # ------------------------------------------------------------- facade
 
