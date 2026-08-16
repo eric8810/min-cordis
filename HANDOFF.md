@@ -75,13 +75,15 @@ uv run pytest -q                      # 85 tests
 
 ## 下一步(按价值排)
 
-核心移植**全部完结**:Service/@Inject/traceable、accessor/mixin、logger、`internal/get`/`internal/set` 瀑布钩子、上游 spec 等价(shadow 4/4、invoke 2/2、associate 4/5、service 5/5、decorator 1/1)、C4/C5/R3 全部清零。剩余是可选延伸:
+核心移植**全部完结**:Service/@Inject/traceable、accessor/mixin、logger、`internal/get`/`internal/set` 瀑布钩子、上游 spec 等价(shadow 4/4、invoke 2/2、associate 4/5、service 5/5、decorator 1/1)、C4/C5/R3 全部清零。上游差距审计(2026-08-16,gpt-5.6-sol)结论:**保留面无新的高危/中危未记录分歧**,快照以来 9 个 core commit 全部三态归位(PRESENT×3 / 有意跳过×4 / 性能级缺失 `29581f6`×1);主要残余风险是 reentrant 生命周期代码已并入但缺对抗性测试。行动按价值:
 
-1. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
-2. 若上游 cordis 有新 commit 值得跟进,以 cordis-workspace 对照 cherry-pick
+1. **移植 `origin/feat/reentrant-fiber-lifecycle` 分支的对抗性测试**(12 项:重入 setup/销毁、pending 子所有权、stale 代、清理失败排序;详见 [docs/audit-upstream-gap-2026-08-16.md](audit-upstream-gap-2026-08-16.md) §3-C;分支在 cordis-workspace 本地克隆)
+2. 补内部扩展点测试:`internal/dispatch` 全模式、async `internal/update`、`internal/config` 变换/否决、async 观察者遏制——钉住有意偏离
+3. (可选)采纳 `29581f6` 免 bind dispatch(保 null-proto/遏制/parallel 如实上报)
+4. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
 
 ## 会话历史摘要(需要细节时查)
 
 - Cordis 学习笔记 + 三波审计:`D:\code\deepseek-harness\docs\research\notes\`
 - 审计波次:wave1(方向切分 6 agent)→ wave2(文件穷尽+二轮对抗 7 agent)→ wave3(端到端裁决+fuzz 2 agent)
-- 供应链事实:上游 fork `deepseek-harness/cordis` 已删(404);core+loader 快照 commit `56b3d4f7` 在 cordiverse 历史;5 个插件包的快照 `abb0a307` 仅存于本地 vendor
+- 供应链事实:上游 fork `deepseek-harness/cordis` 已删(404);core+loader 快照 commit `56b3d4f` 在 cordiverse 历史(旧记 56f3d4f7 有误);5 个插件包的快照 `abb0a307` 仅存于本地 vendor;cordis-workspace 另有未并入 main 的 `origin/feat/reentrant-fiber-lifecycle`(6e576cc、46d2ae5),min-cordis 含其改写但缺其测试
