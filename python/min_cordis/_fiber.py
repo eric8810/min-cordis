@@ -28,6 +28,8 @@ import inspect
 from enum import IntEnum
 from typing import Any, Callable
 
+from ._service import collect_inject_hooks
+from ._traceable import get_traceable
 from ._utils import DisposableList
 
 INACTIVE = "__INACTIVE__"
@@ -121,6 +123,11 @@ class Fiber:
         if runtime is not None:
             self.uid = registry.counter
             self.ctx = parent.extend(fiber=self)
+            # Inject declarations carrying config become intercept entries on
+            # the plugin context (TS Object.create(parent intercept) + own).
+            own_intercept = {k: v for k, v in self.inject.items() if v is not None}
+            if own_intercept:
+                self.ctx._intercept = dict(own_intercept)
             # Emit internal/plugin through the bus with containment.
             parent.events._emit_plugin_created(self)
 
@@ -321,7 +328,9 @@ class Fiber:
             self._store.pop(name, None)
             return
         check = impl.get("check")
-        if check is not None and not check():
+        if check is not None and not check(get_traceable(self.ctx, impl["value"])):
+            # TS invokes `impl.check.call(traceableView)`; here the view is
+            # passed as the first argument (`self` of a Service `_check`).
             self._store.pop(name, None)
             return
         self._store[name] = impl
@@ -378,24 +387,37 @@ class Fiber:
 
     async def _execute(self) -> Any:
         callback = self.runtime.callback
-        instance_or_result = callback(self.ctx, self.config)
+        if isinstance(callback, type):
+            # Class plugin (e.g. a Service subclass): construct, run @Inject
+            # init hooks, then await/collect the `_init` result — never the
+            # instance itself (TS `new callback(ctx, config)` + initHooks +
+            # `instance[symbols.init]?.()`).
+            instance = callback(self.ctx, self.config)
+            if getattr(instance, "_init_hooks", None) is None:
+                instance._init_hooks = collect_inject_hooks(instance)
+            for hook in list(instance._init_hooks or []):
+                hook()
+            init = getattr(instance, "_init", None)
+            value = init() if init is not None else None
+        else:
+            value = callback(self.ctx, self.config)
         # A plugin body IS an effect: a returned disposer, list, or generator
         # is collected exactly like `ctx.effect` (F4 fix).
-        gen = _iterate_effect(instance_or_result)
-        if inspect.isasyncgen(instance_or_result):
-            async for item in instance_or_result:
+        gen = _iterate_effect(value)
+        if inspect.isasyncgen(value):
+            async for item in value:
                 self._collect_one(item)
             return None
-        if asyncio.iscoroutine(instance_or_result):
-            instance_or_result = await instance_or_result
-            gen = _iterate_effect(instance_or_result)
+        if asyncio.iscoroutine(value):
+            value = await value
+            gen = _iterate_effect(value)
         if gen is not None:
             for item in gen:
                 self._collect_one(item)
             return None
-        if instance_or_result is not None:
-            self._collect_one(instance_or_result)
-        return instance_or_result
+        if value is not None:
+            self._collect_one(value)
+        return value
 
     def _collect_one(self, value: Any) -> None:
         if value is None:

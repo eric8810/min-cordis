@@ -13,7 +13,7 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 ├── src\          TS 版:context/reflect/fiber/events/registry/service/utils/logger/index(9 文件)
 ├── tests\        上游 Cordis 测试套件(11 spec / 62 tests,来自 cordis-workspace HEAD)
 ├── test\         自写审计回归(10 tests)
-├── python\       Python 3.11+ 移植(min_cordis\ 6 模块 + tests\ 19 tests)
+├── python\       Python 3.11+ 移植(min_cordis\ 8 模块 + tests\ 37 tests)
 └── docs\         两份等价性审计报告(见下)
 ```
 
@@ -39,11 +39,13 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 - 相对 vendored 原版带 7 项修复 + 2 个上游 cherry-pick(be7d36e callable shadow、8abd903 symbols.caller)
 - 测试:62 上游 + 10 回归全绿
 
-### Python 版:⚠️ 核心骨架,能力边界明确
+### Python 版:✅ 核心骨架 + Service/traceable 完成,能力边界明确
 
-- deepseek-v4-pro 审计发现的 7 项严重/高危偏离**已全部修复**([docs/audit-python-parity-2026-08-16.md](audit-python-parity-2026-08-16.md)),每项带回归测试(19 tests 全绿,`-W error::RuntimeWarning` 干净)
-- **未移植的层**(README 已声明):Service 基类、@Inject 装饰器、traceable/caller 语义、accessor/mixin、intercept 配置合并
-- 存量待验证项:C4(id(label) 键复用)、C5(__setattr__ 绕过校验)、R3(registry.delete fire-and-forget)
+- deepseek-v4-pro 审计发现的 7 项严重/高危偏离**已全部修复**([docs/audit-python-parity-2026-08-16.md](audit-python-parity-2026-08-16.md)),每项带回归测试
+- **Service 基类 + `@Inject` + traceable/caller/shadow 已落地**([docs/design-python-traceable.md](design-python-traceable.md),含实现记录):`_service.py`(Service/Inject/resolveConfig)、`_traceable.py`(访问期绑定视图)、C1–C5 契约全带测试。顺带修复:intercept 原型链语义、inject-config→intercept 条目、`_label_for` 死链
+- 测试 19 → **37**(`-W error::RuntimeWarning` 干净)
+- **未移植的层**(README 已声明):accessor/mixin(associate.spec #3/#4)、`internal/get`/`internal/set` 瀑布钩子、logger 服务
+- 存量待验证项:C4(id(label) 键复用)、C5(__setattr__ 绕过校验)、R3(registry.delete fire-and-forget,service.spec #4 快照对账依赖它)
 
 ## 怎么跑
 
@@ -56,7 +58,7 @@ npm test                              # 两者都跑
 
 # Python(uv 管理,环境已 sync)
 cd C:\Users\eric8810\repos\min-cordis\python
-uv run pytest -q                      # 19 tests
+uv run pytest -q                      # 37 tests
 ```
 
 注意:上游 `Inject` 装饰器是 Stage-3 原生装饰器,`experimentalDecorators` 必须**关闭**(vitest 3 + esbuild,不能用 vitest 4 的 oxc)。
@@ -70,12 +72,11 @@ uv run pytest -q                      # 19 tests
 
 ## 下一步(按价值排)
 
-1. **Python 补 Service 基类 + @Inject**(~200 行 + 测试,最大解锁)
-2. **Python traceable/caller 设计决策**(Python 里对应物是 contextvars 还是显式传参?先讨论再动手)
-3. accessor/mixin + intercept 合并(~150 行)
-4. 移植上游 shadow/invoke/service spec 等价测试(~30 个)
-5. 清 C4/C5/R3 待验证项
-6. 可选:Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
+1. ~~Python 补 Service 基类 + @Inject + traceable/caller~~ ✅ 已完成(见上,设计文档含实现记录)
+2. accessor/mixin(intercept 合并已随 Service 落地;剩 `ctx.accessor`/`ctx.mixin`,~150 行,解锁 associate.spec #3/#4)
+3. 移植上游 spec 剩余等价测试(service.spec #4 快照对账被 R3 阻塞)
+4. 清 C4/C5/R3 待验证项(R3 顺带解锁 #3 的快照测试)
+5. 可选:Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
 
 ## 会话历史摘要(需要细节时查)
 

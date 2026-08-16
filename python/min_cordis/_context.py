@@ -4,6 +4,12 @@ The JS Proxy becomes ``__getattr__``/``__setattr__`` checks: reading an
 undeclared name requires it to be injected (or fails loudly), writing
 requires being the provider. Prototype-chain scoping becomes a parent
 pointer with per-name lookup through the isolate map.
+
+Service reads return *traceable views* bound to the reading context
+(:mod:`min_cordis._traceable`). Reads made through a service's shadow
+context resolve along the provider's fiber chain (``_resolve_walk``, the
+TS ``ReflectService.handler.get`` fallback), so nested access inside a
+service method sees the service's own dependency scope.
 """
 
 from __future__ import annotations
@@ -12,7 +18,22 @@ from typing import Any, Callable
 
 from ._events import Events
 from ._fiber import Fiber, FiberState
+from ._traceable import SHADOW, get_traceable
 from ._utils import INTERCEPT, ISOLATE
+
+
+def _label_object(ctx: Any, name: str) -> Any:
+    """Nearest isolate label for ``name`` walking the context parent chain.
+
+    Equivalent to the TS prototype-chain read ``ctx[symbols.isolate][name]``
+    (nearest map wins; flattened per-fiber copies keep the same values).
+    """
+    while ctx is not None:
+        labels = getattr(ctx, "_isolate", None)
+        if labels is not None and name in labels:
+            return labels[name]
+        ctx = getattr(ctx, "_parent", None)
+    return None
 
 
 class ReflectService:
@@ -24,15 +45,8 @@ class ReflectService:
         self.props: dict[str, str] = {}  # name -> 'service' | 'accessor'
 
     def _label_for(self, ctx: Any, name: str) -> int | None:
-        labels = ctx._isolate
-        if name in labels:
-            return id(labels[name])
-        parent = getattr(ctx, "_parent_isolate", None)
-        while parent is not None:
-            if name in parent:
-                return id(parent[name])
-            parent = parent.get("__parent__")
-        return None
+        obj = _label_object(ctx, name)
+        return id(obj) if obj is not None else None
 
     def _get_impl_for(self, ctx: Any, name: str, strict: bool = True) -> dict | None:
         label = self._label_for(ctx, name)
@@ -46,21 +60,21 @@ class ReflectService:
         return impl
 
     def _get_impl(self, name: str, strict: bool = True) -> dict | None:
-        label = self._label_for(self.root, name)
-        if label is None:
-            return None
-        impl = self.store.get(label)
-        if impl is None:
-            return None
-        if strict and impl["fiber"].state != FiberState.ACTIVE:
-            return None
-        return impl
+        return self._get_impl_for(self.root, name, strict)
 
-    def provide(self, name: str, value: Any, check: Callable[[], bool] | None = None, ctx: Any | None = None) -> Callable[[], Any]:
+    def provide(
+        self,
+        name: str,
+        value: Any = None,
+        check: Callable[..., bool] | None = None,
+        ctx: Any | None = None,
+    ) -> Callable[[], Any]:
         """Register a service owned by the calling context's fiber.
 
         ``ctx`` is the context the provide call was made on (plugin contexts
-        pass their own); defaults to the root for direct calls.
+        pass their own); defaults to the root for direct calls. ``check`` is
+        invoked by dependents as ``check(traceable_view)`` (TS: called as a
+        method of the traced service).
         """
         ctx = ctx or self._current_ctx()
         fiber = ctx.fiber
@@ -69,9 +83,12 @@ class ReflectService:
             if name in self.props and self.props[name] != "service":
                 raise RuntimeError(f'property "{name}" is already declared as {self.props[name]}')
             self.props[name] = "service"
-            # The label is resolved in the PROVIDING context's isolate scope,
-            # so an isolated subtree registers under its own label.
-            label_obj = ctx._isolate.setdefault(name, object()) if name in ctx._isolate else self.root._isolate.setdefault(name, object())
+            # The label is the nearest one in the PROVIDING context's isolate
+            # chain, falling back to a fresh symbol interned on the root map
+            # (TS ``root[symbols.isolate][name] ??= Symbol(name)``).
+            label_obj = _label_object(ctx, name)
+            if label_obj is None:
+                label_obj = self.root._isolate.setdefault(name, object())
             label = id(label_obj)
             if label in self.store:
                 other = self.store[label]
@@ -97,7 +114,8 @@ class ReflectService:
     def get(self, name: str, strict: bool = True, ctx: Any | None = None) -> Any:
         ctx = ctx or self._current_ctx()
         impl = self._get_impl_for(ctx, name, strict)
-        return None if impl is None else impl["value"]
+        value = None if impl is None else impl["value"]
+        return get_traceable(ctx, value)
 
     def set(self, name: str, value: Any, ctx: Any | None = None) -> None:
         ctx = ctx or self._current_ctx()
@@ -149,6 +167,7 @@ class Context:
     """Root and child dependency containers."""
 
     def __init__(self, on_error: Callable[[BaseException], None] | None = None) -> None:
+        self._shadow: Any = None
         self._isolate: dict[str, Any] = {}
         self._intercept: dict[str, Any] = {}
         self._parent_isolate: dict[str, Any] | None = None
@@ -199,6 +218,13 @@ class Context:
             setattr(child, key, value)
         return child
 
+    def _stripped(self) -> "Context":
+        """The context below any service-shadow markers (TS binding strip)."""
+        ctx = self
+        while getattr(ctx, SHADOW, None) is not None:
+            ctx = ctx._parent
+        return ctx
+
     def isolate(self, name: str, label: Any | None = None) -> "Context":
         child = self.extend()
         child._isolate = dict(self._isolate)
@@ -207,9 +233,26 @@ class Context:
 
     def intercept(self, name: str, config: Any) -> "Context":
         child = self.extend()
-        child._intercept = dict(self._intercept)
-        child._intercept[name] = config
+        # Own-entry map over the parent's (TS Object.create chain): reads walk
+        # the context parent chain, so ancestor entries for the same name are
+        # preserved instead of flattened away.
+        child._intercept = {name: config}
         return child
+
+    def _intercept_entries(self, name: str) -> list[Any]:
+        """Intercept entries for ``name``, root first, deduplicated by map."""
+        entries: list[Any] = []
+        seen: set[int] = set()
+        ctx: Any = self
+        while ctx is not None:
+            intercept = getattr(ctx, "_intercept", None)
+            if intercept is not None and id(intercept) not in seen:
+                seen.add(id(intercept))
+                if name in intercept:
+                    entries.append(intercept[name])
+            ctx = getattr(ctx, "_parent", None)
+        entries.reverse()
+        return entries
 
     # --------------------------------------------------- attribute service
 
@@ -217,16 +260,43 @@ class Context:
         # __getattr__ only fires when normal lookup fails; services land here.
         # Reads require a declared inject on every context (tighter than the
         # TS root-context leniency, per the audit finding); `ctx.get(name)` is
-        # the opportunistic escape hatch.
+        # the opportunistic escape hatch. Reads through a service's shadow
+        # context follow the provider's dependency chain instead.
         if name.startswith("_"):
             raise AttributeError(name)
-        injected = name in self._effective_inject()
-        if not injected:
+        if getattr(self, SHADOW, None) is not None:
+            return self._resolve_walk(name)
+        if name not in self._effective_inject():
             raise RuntimeError(f'cannot get property "{name}" without inject')
         value = self.reflect.get(name, strict=True, ctx=self)
-        if value is not None:
-            return value
-        raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+        if value is None:
+            raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+        return value
+
+    def _resolve_walk(self, name: str) -> Any:
+        """The TS ReflectService get fallback: walk the fiber store chain.
+
+        Starts at the shadow provider's fiber (or the reading fiber), finds
+        the nearest store entry, and stops at root or at an isolation
+        boundary. Root-context reads stay lenient (non-strict lookup).
+        """
+        marker = getattr(self, SHADOW, None)
+        start = marker if marker is not None else self
+        fiber = start.fiber
+        if marker is None and fiber.runtime is None:
+            return self.reflect.get(name, strict=False, ctx=self)
+        root_label = self.root._isolate.get(name)
+        while True:
+            impl = fiber.store.get(name) if fiber.store else None
+            if impl is not None:
+                return get_traceable(self, impl["value"])
+            if name in fiber.inject:
+                raise RuntimeError(f'cannot get required service "{name}" in inactive context')
+            if fiber.runtime is None:
+                raise RuntimeError(f'cannot get property "{name}" without inject')
+            if _label_object(fiber.parent, name) is not root_label:
+                raise RuntimeError(f'cannot get property "{name}" without inject')
+            fiber = fiber.parent.fiber
 
     def _effective_inject(self) -> set[str]:
         return self.__dict__.get("_inject_requested", set())
@@ -240,30 +310,35 @@ class Context:
     # ------------------------------------------------------------- facade
 
     def get(self, name: str, strict: bool = True) -> Any:
-        return self.reflect.get(name, strict=strict, ctx=self)
+        return self.reflect.get(name, strict=strict, ctx=self._stripped())
 
     def set(self, name: str, value: Any) -> None:
-        self.reflect.set(name, value, ctx=self)
+        self.reflect.set(name, value, ctx=self._stripped())
 
-    def provide(self, name: str, value: Any, check: Callable[[], bool] | None = None) -> Callable[[], Any]:
-        return self.reflect.provide(name, value, check, ctx=self)
+    def provide(self, name: str, value: Any = None, check: Callable[..., bool] | None = None) -> Callable[[], Any]:
+        return self.reflect.provide(name, value, check, ctx=self._stripped())
 
     def effect(self, execute: Callable[[], Any], label: str = "anonymous") -> Callable[[], Any]:
         return self.fiber.effect(execute, label)
 
     def plugin(self, plugin: Any, config: Any = None) -> Any:
-        """Load a plugin under this context; returns an awaitable fiber view."""
-        return self.registry.plugin(plugin, config, parent=self)
+        """Load a plugin under this context; returns an awaitable fiber view.
+
+        The parent is the shadow-stripped context: plugins created from
+        inside service methods attach to the real consumer scope (upstream
+        shadow.spec "strips service shadow before creating plugins").
+        """
+        return self.registry.plugin(plugin, config, parent=self._stripped())
 
     def inject_plugins(self, deps: Any, callback: Callable) -> Any:
         """Run a callback once the requested services are available."""
-        return self.registry.inject(deps, callback, parent=self)
+        return self.registry.inject(deps, callback, parent=self._stripped())
 
     def on(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
-        return self.events.on(name, listener, options, ctx=self)
+        return self.events.on(name, listener, options, ctx=self._stripped())
 
     def once(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
-        return self.events.once(name, listener, options, ctx=self)
+        return self.events.once(name, listener, options, ctx=self._stripped())
 
     async def parallel(self, *args: Any) -> None:
         await self.events.parallel(*args)

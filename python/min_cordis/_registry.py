@@ -76,7 +76,10 @@ class Registry:
         if isinstance(plugin, type) and hasattr(plugin, "apply"):
             return getattr(plugin, "apply"), getattr(plugin, "name", plugin.__name__), getattr(plugin, "Config", None), getattr(plugin, "inject", None)
         if callable(plugin):
-            return plugin, getattr(plugin, "name", None), getattr(plugin, "Config", None), getattr(plugin, "inject", None)
+            # TS `plugin.name`: classes and named functions carry it natively;
+            # Python needs the __name__ fallback for display parity.
+            name = getattr(plugin, "name", None) or getattr(plugin, "__name__", None)
+            return plugin, name, getattr(plugin, "Config", None), getattr(plugin, "inject", None)
         return None
 
     def plugin(self, plugin: Any, config: Any = None, parent: Any = None) -> _FiberView:
