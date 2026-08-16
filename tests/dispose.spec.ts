@@ -67,9 +67,14 @@ describe('Effects', () => {
       { label: 'ctx.on("custom-event")', children: [] },
     ])
     expect(seq).to.deep.equal([])
-    dispose()
+    // Upstream reentrant-branch revision of this test: nested effect
+    // wrappers settle through promise chains, so the disposal is awaited
+    // rather than asserted synchronously.
+    const task = dispose()
+    expect(dispose()).to.equal(task)
+    await task
     expect(seq).to.deep.equal([3, 2, 1])
-    dispose()
+    await dispose()
     expect(seq).to.deep.equal([3, 2, 1])
   })
 
@@ -215,7 +220,10 @@ describe('Effects', () => {
       return () => seq.push(1)
     })
     expect(seq).to.deep.equal([])
-    await expect(dispose).rejects.toThrow()
+    // Promise.resolve adopts the thenable: execution failures surface
+    // through the await channel (upstream reentrant-branch revision of
+    // this test; vitest's `.rejects` would call a bare function first).
+    await expect(Promise.resolve(dispose)).rejects.toThrow()
     expect(seq).to.deep.equal([])
   })
 

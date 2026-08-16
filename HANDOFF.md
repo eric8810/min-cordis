@@ -55,7 +55,7 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 ```powershell
 # TS(需要 node >=22、已 corepack enable;仓库 node_modules 已装)
 cd C:\Users\eric8810\repos\min-cordis
-npx vitest run                        # 62 上游测试
+npx vitest run                        # 96 tests(62 上游 + 27 reentrant 生命周期 + 7 内部钩子)
 node --import tsx --test "test/*.test.ts"   # 10 回归
 npm test                              # 两者都跑
 
@@ -75,12 +75,11 @@ uv run pytest -q                      # 85 tests
 
 ## 下一步(按价值排)
 
-核心移植**全部完结**:Service/@Inject/traceable、accessor/mixin、logger、`internal/get`/`internal/set` 瀑布钩子、上游 spec 等价(shadow 4/4、invoke 2/2、associate 4/5、service 5/5、decorator 1/1)、C4/C5/R3 全部清零。上游差距审计(2026-08-16,gpt-5.6-sol)结论:**保留面无新的高危/中危未记录分歧**,快照以来 9 个 core commit 全部三态归位(PRESENT×3 / 有意跳过×4 / 性能级缺失 `29581f6`×1);主要残余风险是 reentrant 生命周期代码已并入但缺对抗性测试。行动按价值:
+核心移植**全部完结**;上游差距审计(2026-08-16,gpt-5.6-sol)的 Top 2 行动也已落实:**reentrant 对抗性生命周期测试**(27 个,带动 effect 机制升级为分支的 EffectRecord 处置契约:执行/清理双通道、全量 LIFO、恰好一次处置任务、stale 代际防毒化)+ **内部扩展点钉子**(7 个:internal/dispatch/config/update/status)。TS 96+10、Python 85 双模式全绿。剩余:
 
-1. **移植 `origin/feat/reentrant-fiber-lifecycle` 分支的对抗性测试**(12 项:重入 setup/销毁、pending 子所有权、stale 代、清理失败排序;详见 [docs/audit-upstream-gap-2026-08-16.md](audit-upstream-gap-2026-08-16.md) §3-C;分支在 cordis-workspace 本地克隆)
-2. 补内部扩展点测试:`internal/dispatch` 全模式、async `internal/update`、`internal/config` 变换/否决、async 观察者遏制——钉住有意偏离
-3. (可选)采纳 `29581f6` 免 bind dispatch(保 null-proto/遏制/parallel 如实上报)
-4. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
+1. (可选,低价值)采纳 `29581f6` 免 bind dispatch
+2. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
+3. Python 侧同步 EffectRecord 处置契约(全量 LIFO/AggregateError/处置任务同一性)——TS 已升级,Python `_fiber.py` 还是旧链,两版语义面在此处不一致
 
 ## 会话历史摘要(需要细节时查)
 

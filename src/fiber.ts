@@ -111,9 +111,22 @@ interface EffectRunner<T> {
 // effects must still be able to join a cleanup that another caller started.
 const effectInertia = new WeakMap<Disposable, () => void | Promise<void>>()
 
+// Structural owners consult this instead of raw logging, so a wrapper's
+// recorded cleanup failures are reported exactly once (port of the upstream
+// reentrant-lifecycle branch's EffectRecord reporting).
+const cleanupReporters = new WeakMap<Disposable, (fallback?: unknown) => void>()
+
 function runDisposable(dispose: Disposable) {
   const result = dispose()
   return effectInertia.get(dispose)?.() ?? result
+}
+
+/** Combine cleanup failures without flattening user AggregateErrors. */
+function combineCleanupErrors(errors: unknown[]) {
+  // Do not flatten user AggregateErrors: one cleanup callback owns one error.
+  if (!errors.length) return
+  if (errors.length === 1) return errors[0]
+  return new AggregateError(errors, 'multiple cleanup errors')
 }
 
 /** Notify plugin teardown without allowing one observer to break ownership cleanup. */
@@ -207,6 +220,7 @@ export class Fiber {
 
   private _error: any
   private _runner: EffectRunner<string>
+  private _generation = 0
   private _store: Dict<Impl> = Object.create(null)
 
   /**
@@ -421,32 +435,28 @@ export class Fiber {
       throw new CordisError('INACTIVE_EFFECT')
     }
 
-    const disposables: Disposable[] = []
-    let disposing = false
-    let disposalTask: void | Promise<void>
-    const dispose = () => {
-      if (disposing) return disposalTask
-      disposing = true
-      let task!: void | Promise<void>
-      for (const disposable of disposables.splice(0).reverse()) {
-        if (task) {
-          task = task.then(() => runDisposable(disposable))
-        } else {
-          const result = runDisposable(disposable)
-          if (isObject(result) && 'then' in result) {
-            task = result as any
-          }
-        }
-      }
-      return disposalTask = task
-    }
+    // Port of the upstream reentrant-lifecycle branch's EffectRecord:
+    // execution and disposal are separate result channels joined through one
+    // exactly-once disposal task. Every cleanup runs (strict LIFO, awaited
+    // in order); rejections are recorded, never veto the remaining
+    // callbacks, and combine into a single AggregateError (user aggregates
+    // stay unflattened). Repeated disposal calls join the first task.
+    const cleanups: Disposable[] = []
+    const cleanupFailures: { error: unknown, source?: Disposable }[] = []
+    let cleanupReported = false
+    let executionState: 'running' | 'pending' | 'fulfilled' | 'rejected' = 'running'
+    let executionError: unknown
+    let executionTask: Promise<void> | undefined
+    let executionGate: { promise: Promise<void>, resolve: () => void, reject: (reason: unknown) => void } | undefined
+    let disposalTask: Promise<void> | undefined
+    let removeWrapper = () => false
 
     const meta: EffectMeta = { label, children: [] }
     const runner: EffectRunner<boolean> = {
       execute,
       epoch: true,
       collect: (dispose) => {
-        disposables.push(dispose)
+        cleanups.push(dispose)
         this._disposables.delete(dispose)
         if (dispose[symbols.effect]) {
           meta.children.push(dispose[symbols.effect])
@@ -455,107 +465,170 @@ export class Fiber {
       getOuterStack: buildOuterStack(),
     }
 
-    let task: void | Promise<void>
-    let executing = true
-    let resolveSetup: (() => void) | undefined
-    let rejectSetup: ((reason: unknown) => void) | undefined
-    let setupBarrier: Promise<void> | undefined
-    let setupFailed = false
-    let inFlight: void | Promise<void>
-    let removeWrapper = () => false
-
-    const waitForSetup = () => {
-      setupBarrier ??= new Promise<void>((resolve, reject) => {
-        resolveSetup = resolve
-        rejectSetup = reject
-      })
-      return setupBarrier
-    }
-
-    const disposeAfter = (setup: PromiseLike<void>) => {
-      return Promise.resolve(setup).then(
-        () => dispose(),
-        async (reason) => {
-          await dispose()
-          throw reason
-        },
-      )
-    }
-
-    const finalizeDisposal = (callback: () => void | Promise<void>) => {
-      let result: void | Promise<void>
-      try {
-        result = callback()
-      } catch (error) {
-        removeWrapper()
-        throw error
+    const reportCleanupFailures = (fallback?: unknown) => {
+      if (cleanupReported) return
+      cleanupReported = true
+      if (!cleanupFailures.length) {
+        if (fallback !== undefined) this.ctx.logger.error(fallback)
+        return
       }
-      if (isObject(result) && 'then' in result) {
-        const pending = Promise.resolve(result).finally(() => {
-          removeWrapper()
-          if (inFlight === pending) inFlight = undefined
+      for (const failure of cleanupFailures) {
+        const report = failure.source && cleanupReporters.get(failure.source)
+        if (report) {
+          // A nested effect's failure is reported by its own record, once.
+          report(failure.error)
+        } else {
+          this.ctx.logger.error(failure.error)
+        }
+      }
+    }
+
+    const waitForExecution = (): Promise<void> => {
+      if (executionState === 'fulfilled') return Promise.resolve()
+      if (executionState === 'rejected') return Promise.reject(executionError)
+      if (executionTask) return executionTask
+      if (!executionGate) {
+        // Synchronous execution normally allocates no promise. The gate is
+        // created only when disposal actually reenters before execution
+        // returns.
+        let resolve!: () => void
+        let reject!: (reason: unknown) => void
+        const promise = new Promise<void>((res, rej) => {
+          resolve = res
+          reject = rej
         })
-        return inFlight = pending
+        promise.catch(() => {})
+        executionGate = { promise, resolve, reject }
       }
-      removeWrapper()
-      return result
+      return executionGate.promise
     }
 
-    const wrapper = defineProperty(() => {
-      // A synchronous setup failure can race an owner unload that already
-      // captured this wrapper but has not invoked it yet. The failed effect is
-      // never returned publicly, so let that internal caller await rollback.
-      if (!runner.epoch) return setupFailed ? inFlight : undefined
+    const runCleanups = (): unknown[] | Promise<unknown[]> => {
+      const failures = cleanupFailures
+      const pending = cleanups.splice(0).reverse()
+      let index = 0
+
+      const next = (): void | Promise<void> => {
+        while (index < pending.length) {
+          const dispose = pending[index++]
+          try {
+            const result = dispose()
+            if (isObject(result) && 'then' in result) {
+              // Preserve strict LIFO ordering across async cleanup. Rejections
+              // are recorded and do not veto the remaining cleanup callbacks.
+              return Promise.resolve(result).then(next, (error) => {
+                failures.push({ error, source: dispose })
+                return next()
+              })
+            }
+          } catch (error) {
+            failures.push({ error, source: dispose })
+          }
+        }
+      }
+
+      const result = next()
+      return isObject(result) && 'then' in result
+        ? Promise.resolve(result).then(() => failures)
+        : failures
+    }
+
+    const finishDisposal = () => {
+      const finalize = (failures: { error: unknown }[]) => {
+        const error = combineCleanupErrors(failures.map(failure => failure.error))
+        return error ? Promise.reject<void>(error) : Promise.resolve()
+      }
+      const result = runCleanups()
+      if (isObject(result) && 'then' in result) {
+        return { task: Promise.resolve(result).then(finalize), synchronous: false }
+      }
+      return { task: finalize(result), synchronous: true }
+    }
+
+    const startDisposal = (): Promise<void> => {
+      // Public callers and structural owners always join the first task;
+      // cleanup itself is exactly-once.
+      if (disposalTask) return disposalTask
       runner.epoch = false
-      return finalizeDisposal(() => {
-        if (executing) return disposeAfter(waitForSetup())
-        return task ? disposeAfter(task) : dispose()
+
+      let task: Promise<void>
+      let synchronous = false
+      if (executionState === 'fulfilled' || executionState === 'rejected') {
+        ;({ task, synchronous } = finishDisposal())
+      } else {
+        task = waitForExecution().then(
+          () => finishDisposal().task,
+          () => finishDisposal().task,
+        )
+      }
+
+      if (synchronous && !this.inertia) {
+        // Outside an owner transition, fully synchronous cleanup can retire
+        // the wrapper immediately. During unload it stays joinable until
+        // settlement.
+        removeWrapper()
+        disposalTask = task
+      } else {
+        disposalTask = task.then(
+          () => { removeWrapper() },
+          (error) => {
+            removeWrapper()
+            throw error
+          },
+        )
+      }
+      disposalTask.catch(() => {})
+      return disposalTask
+    }
+
+    const failExecution = (reason: unknown, report = false) => {
+      executionState = 'rejected'
+      executionError = reason
+      executionGate?.reject(reason)
+      if (report) this.ctx.logger.error(reason)
+      // Execution and disposal are separate result channels. The execution
+      // error is delivered by throw/the thenable; structural owners only
+      // join cleanup and observe cleanup failures.
+      startDisposal().catch(error => reportCleanupFailures(error))
+    }
+
+    const settleExecution = (task: void | Promise<void>) => {
+      if (!isObject(task) || !('then' in task)) {
+        executionState = 'fulfilled'
+        executionGate?.resolve()
+        return
+      }
+      executionState = 'pending'
+      // Keep one execution task for both the thenable effect API and
+      // disposal that starts while asynchronous execution is pending.
+      executionTask = Promise.resolve(task).then(() => {
+        executionState = 'fulfilled'
+        executionGate?.resolve()
+      }, (reason) => {
+        failExecution(reason, true)
+        throw reason
       })
-    }, symbols.effect, meta) as AsyncDisposable
-    effectInertia.set(wrapper, () => inFlight)
+      executionTask.catch(() => {})
+    }
+
+    const wrapper = defineProperty(() => startDisposal(), symbols.effect, meta) as AsyncDisposable<Promise<void>>
+    effectInertia.set(wrapper, () => disposalTask)
+    cleanupReporters.set(wrapper, reportCleanupFailures)
 
     // Make the effect visible to a reentrant owner unload before execute()
     // runs any plugin code. Async teardown stays owner-visible until it
     // settles, allowing an outer effect to join cleanup another caller began.
     removeWrapper = this._disposables.push(wrapper)
+    let task: void | Promise<void>
     try {
       task = this._execute(runner)
     } catch (reason) {
-      executing = false
-      setupFailed = true
-      runner.epoch = false
-      let cleanup: void | Promise<void>
-      try {
-        cleanup = finalizeDisposal(dispose)
-      } finally {
-        rejectSetup?.(reason)
-      }
-      if (isObject(cleanup) && 'then' in cleanup) {
-        cleanup.catch(error => this.ctx.logger.error(error))
-      }
+      failExecution(reason)
       throw reason
     }
-    executing = false
-    if (setupBarrier) {
-      Promise.resolve(task).then(resolveSetup, rejectSetup)
-    }
-
-    // prevent unhandled rejection 鈥?both from `task` itself and from the
-    // disposer chain if it fails to settle cleanly.
-    task?.catch(() => {
-      if (!runner.epoch) return dispose()
-      return finalizeDisposal(dispose)
-    }).catch((error) => this.ctx.logger.error(error))
-
-    const disposeAsync = () => {
-      if (!runner.epoch) return
-      runner.epoch = false
-      return finalizeDisposal(dispose)
-    }
-    wrapper.then = async (onFulfilled, onRejected) => {
-      return Promise.resolve(task)
-        .then(() => disposeAsync)
-        .then(onFulfilled, onRejected)
+    settleExecution(task)
+    wrapper.then = (onFulfilled, onRejected) => {
+      return waitForExecution().then(() => startDisposal).then(onFulfilled, onRejected)
     }
     return wrapper
   }
@@ -627,19 +700,6 @@ export class Fiber {
     this._store[name] = impl
   }
 
-  _refresh() {
-    let epoch: string | boolean = false
-    epoch = ''
-    for (const name of Object.keys(this.inject)) {
-      const impl = this._store[name]
-      if (!impl) {
-        epoch = INACTIVE
-        break
-      }
-      epoch += ':' + impl.fiber.uid
-    }
-    this._setEpoch(epoch)
-  }
 
   private _setEpoch(epoch: string) {
     const oldEpoch = this._runner.epoch
@@ -655,6 +715,29 @@ export class Fiber {
         return FiberState.UNLOADING
       }
     })
+  }
+
+  /**
+   * Recompute the epoch from current dependency availability.
+   *
+   * Non-forced refreshes use the content-derived epoch (provider uids), so
+   * equal notifications coalesce — mainline semantics. A forced refresh
+   * allocates a fresh generation token instead: an in-flight load carrying
+   * an older token becomes stale (its late failures cannot poison the newer
+   * generation) even when the dependency content is unchanged.
+   */
+  _refresh(force = false) {
+    let epoch = ''
+    for (const name of Object.keys(this.inject)) {
+      const impl = this._store[name]
+      if (!impl) {
+        epoch = INACTIVE
+        break
+      }
+      epoch += ':' + impl.fiber.uid
+    }
+    if (force && epoch !== INACTIVE) epoch += '#' + ++this._generation
+    this._setEpoch(epoch)
   }
 
   /** Resolve raw config through `internal/config` and the runtime schema. */
@@ -677,10 +760,13 @@ export class Fiber {
         this._error = undefined
       }
     } catch (reason) {
-      // impl guarantees that the error is non-null (?)
       this.ctx.logger.error(reason)
-      this._error = reason
-      this._runner.epoch = INACTIVE
+      // A stale generation's late failure cannot poison the current one:
+      // only own the failure when no newer token took over while the body ran.
+      if (this._runner.epoch === oldEpoch) {
+        this._error = reason
+        this._runner.epoch = INACTIVE
+      }
     }
     this._updateState(() => {
       if (this._runner.epoch === oldEpoch) {
@@ -701,7 +787,14 @@ export class Fiber {
           await runDisposable(dispose)
         }, this._runner.getOuterStack)
       } catch (reason) {
-        this.ctx.logger.error(reason)
+        // A wrapper reports its recorded cleanup failures exactly once;
+        // raw disposables log the combined rejection directly.
+        const report = cleanupReporters.get(dispose)
+        if (report) {
+          report(reason)
+        } else {
+          this.ctx.logger.error(reason)
+        }
       }
     }))
     this.store = undefined
@@ -771,8 +864,15 @@ export class Fiber {
       fiber._config = config
       fiber._error = undefined
       fiber._setEpoch(INACTIVE)
-      fiber._refresh()
-      return
+      // Force a fresh generation token: an in-flight load carrying the old
+      // config becomes stale (and its late failures cannot poison this one)
+      // even though the dependency content is unchanged.
+      fiber._refresh(true)
+      // Join the transition this update coalesced into: the returned promise
+      // settles once the in-flight generation (loading or unloading) is done.
+      // Rejections are the fiber's channel (await the fiber for errors), so
+      // callers that ignore the result never see an unhandled rejection.
+      return fiber.await().catch(() => {})
     }
     // Validate and resolve before touching stored state: a rejected update
     // must not poison the config a later reload would consume.

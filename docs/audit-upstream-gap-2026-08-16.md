@@ -48,4 +48,24 @@
 2. **补内部扩展点测试**:`internal/dispatch` 全模式、async `internal/update`、`internal/config` 变换/否决、async 观察者遏制——保护有意偏离不被"简化"回上游 bug。
 3. (可选)**采纳 `29581f6` 原始回调 dispatch 路径**,同时保留 null-proto hook map、异步遏制、parallel 如实上报、逐回调遏制。
 
+## 5. 行动 #1/#2 落实记录(同日)
+
+**行动 #1 完成**:`tests/reentrant.spec.ts`(27 tests)从 `origin/feat/reentrant-fiber-lifecycle` 的 fiber/dispose spec 移植。为满足其契约,`src/fiber.ts` 的 effect 机制升级为分支的 EffectRecord 语义:
+- **处置通道与执行通道分离**:执行错误走 throw/thenable;清理失败走处置任务(单个→原样,多个→AggregateError,用户聚合不展平)
+- **全量 LIFO 清理**:每个 cleanup 都执行(async 严格串行),拒绝记录不否决后续
+- **恰好一次处置任务**:重复调用/结构性 owner 一律并入首个 task(同一性断言钉住)
+- 同步失败回滚不再吞掉执行错误;`reportCleanupFailures` 恰好一次上报(嵌套 effect 归属其自身 record)
+- `await effect` 解析为 disposer 函数本身(分支契约)
+- **stale 代际防毒化**:`_reload` catch 只在 epoch 未被更新时占有失败;`update()` defer 分支改 `_refresh(true)` 生成带 `#N` 后缀的代际令牌(依赖内容不变也区分新旧代)
+- `_unload` 的 wrapper 拒绝经 cleanupReporters 上报(不再裸 log)
+
+**有意不移植(与 mainline 钉住的语义冲突,spec 头部注明)**:
+- "reloads when an implementation is replaced during loading" 与 "availability ABA transition"——需要分支的 provider-incarnation/DesiredSnapshot epoch,与 mainline `inertia lock 2`(同 fiber 重提供→完成在途加载)互斥
+- 两个 config-validation 传播测试——需要分支的构造期急切校验(`_configError` 门控),与审计钉住的 "PENDING fiber 延迟校验到激活" 互斥
+- mainline 的 'yield dispose'/'async return with error' 两处测试按分支同款修订调整(await task / Promise.resolve 形态;vitest `.rejects` 对函数会先调用)
+
+**行动 #2 完成**:`tests/internal-hooks.spec.ts`(7 tests)——internal/dispatch 五模式载荷+thisArg+internal 前缀静默、internal/config 变换(经返回值携带,inner 忽略参数)、internal/update 否决(替换 restart)、internal/status 异步 rejection 遏制、公开 dispatch() 消费签名+this 绑定。
+
+TS 测试 62+10 → **96+10**;Python 85 不受影响(TS-only 改动)。行动 #3(29581f6 免 bind)仍开放,价值低。
+
 原文全量报告见本会话;仓库另有 docs/audit-ts-parity-2026-08-16.md(TS 侧等价性)与 docs/audit-python-parity-2026-08-16.md(Python 侧)。
