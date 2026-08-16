@@ -1,0 +1,23 @@
+{
+  "name": "min-cordis",
+  "version": "0.1.0",
+  "description": "Minimal Cordis core: context, services, plugins, fiber lifecycle, and the event bus — without the loader/HMR/schema layers. Derived from Cordis 4.0.0-rc.7.",
+  "type": "module",
+  "license": "MIT",
+  "repository": "https://github.com/eric8810/min-cordis",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --import tsx --test \"test/*.test.ts\""
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0"
+  }
+}
