@@ -38,7 +38,8 @@ class TestLogger:
         captured = capsys.readouterr()
         assert "visible" in captured.err
 
-    async def test_service_is_callable_and_keeps_error_ring(self, ctx):
+    async def test_service_is_callable_and_keeps_error_ring(self, ctx, monkeypatch):
+        monkeypatch.setenv("MIN_CORDIS_LOG", "error")  # silence stderr in this test
         assert isinstance(ctx.logger, LoggerService)
         named = ctx.logger("plugin-a")
         assert isinstance(named, Logger)
@@ -47,6 +48,22 @@ class TestLogger:
         ctx.logger.error("boom", 42)
         ctx.logger.error("again")
         assert ctx.logger.errors[-2:] == [("boom", 42), ("again",)]
+
+    async def test_error_ring_eviction_keeps_newest(self, ctx, monkeypatch):
+        monkeypatch.setenv("MIN_CORDIS_LOG", "error")  # silence stderr in this test
+        for i in range(1002):
+            ctx.logger.error("e", i)
+        assert len(ctx.logger.errors) == LoggerService.ERROR_RING_LIMIT
+        assert ctx.logger.errors[0] == ("e", 2)  # oldest kept entry
+        assert ctx.logger.errors[-1] == ("e", 1001)
+
+    def test_invalid_log_level_falls_back_to_info(self, ctx, monkeypatch, capsys):
+        monkeypatch.setenv("MIN_CORDIS_LOG", "not-a-level")
+        log = ctx.logger("fallback")
+        log.debug("hidden")
+        assert capsys.readouterr().out == ""
+        log.info("shown")
+        assert "shown" in capsys.readouterr().out
 
 
 class TestInternalGetWaterfall:
@@ -100,8 +117,10 @@ class TestInternalGetWaterfall:
 class TestInternalSetWaterfall:
     async def test_short_circuit_and_delegation(self, ctx):
         blocked: list = []
+        carriers: list = []
 
         def handler(c, name, value, error, nxt):
+            carriers.append(type(error).__name__)
             if value == 99:
                 blocked.append(name)
                 return True  # short-circuit: the write is swallowed
@@ -120,4 +139,5 @@ class TestInternalSetWaterfall:
 
         assert blocked == ["svc"]
         assert ctx.get("svc") == 5
+        assert carriers and all(k == "RuntimeError" for k in carriers)
         await view.dispose()

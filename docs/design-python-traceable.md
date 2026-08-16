@@ -114,3 +114,25 @@ caller 语义的本质是"**绑定随引用走,不随动态作用域走**"——
 - `_logger.py`:`Logger`(MIN_CORDIS_LOG 阈值,error/warn→stderr)+ `LoggerService`(callable `_invoke`、errors 环形缓冲 1000 上限、tracker `{associate: 'logger', no_shadow: True}`,构造后覆写)。安装于 `Context.__init__`,`ctx.logger` 存 traceable 视图。**双面设计**:错误遏制继续走注入的 `on_error` sink(诊断面),logger 是用户面——不互串,测试可确定性断言。
 - `internal/get` 瀑布:包住插件 ctx 的服务读(`__getattr__` fallback)与 `_resolve_walk` 的 walk 循环;root 宽松读在瀑布外(TS 同层)。`internal/set` 瀑布:包住 `__setattr__` 的 reflect.set 路径。listener 签名 `(ctx, name, [value,] error, next)`。
 - 坑:`Events.waterfall` 的 inner 会以 listener 参数调用 fallback——fallback 必须收 `*_`(与 TS 箭头函数无参不同);`ctx.on` 的 disposer 返回协程要 await。
+
+## 九、独立 review 轮(两 agent 交叉审查后修复)
+
+两个独立 agent(Kai:TS↔Python 逐条对账;Mara:测试质量与空转分析)审查后修复的项:
+
+**实现层真 bug(4 个)**
+1. `_TraceableView.__setattr__` 下划线白名单放行 `_caller` 写入——静默改写视图绑定(TS 拒写 caller/original/ctx)。三个 wrapper 的白名单全部移除,构造器本就走 `object.__setattr__`。
+2. **`notify` 作用域硬编码 root**:TS 经 traceable 视图让 `ctx1.provide` 的依赖通知以 ctx1 为比较基准,Python 原实现全部比 root——隔离作用域内的消费者永远不被通知。加 `source_ctx` 参数,provide/unregister 传入。
+3. async-generator effect/插件体的 abort 缺失段间 epoch 检查(TS fiber.ts:390):drain 循环加 abort flag,`_execute` 循环先查 epoch 再前进(顺序对齐 TS)。
+4. root fiber 不永生:logger 的 provide 挂在 root ledger 上,Context ctor 末尾补 `_disposables.clear()`(TS context.ts:84 同款)。
+
+**测试层(空转/弱化修复 + 补面)**
+- `test_compare_snapshot` 三个快照全 `{}`(完全空转)→ 重写为真实三层嵌套 listener 的 snapshot 对账(`test_snapshot_restores_after_registry_delete`,前置断言 `after == 3`)。
+- 三处「断言只在回调里」补外层 marker(C5 写拒绝、associate #3 inner/scope、associate #4 scope)。
+- `sleep(0)`×2 微任务计数 → `await view` + state 断言。
+- 两处 `isinstance`-only 升级为绑定/身份断言(`view._binding is ctx`、`_root_target() is instance`)。
+- 新增 `test_fiber_lifecycle.py`(14):inertia lock 1/2/3(假时钟→asyncio.Event)、plugin error→FAILED、dispose error 容制、await view 抛错契约、update 竞态(inject 重载中 update、PENDING fiber 延迟校验)、async-gen abort ×3(effect 两形态+插件体)、同步 setup 异常透传。
+- 新增 `test_events_isolate.py`(11):FILTER 选择(TS Session/Filter 委托舞步)、全模式过滤、once 先卸载、parallel ExceptionGroup 成员对账、waterfall veto 压制后注册 listener、同步异常透传;isolate 全矩阵(root/ctx1/ctx2 五阶段计数)、shared label 合并作用域、isolated event(Service FILTER 安装);injected-but-inactive 读抛错护栏。
+- 新增 `test_plugin_surface.py`(8):dict 插件 config 同一性、非法形状、inactive 拒绝、显示名、嵌套 registry 对账+双 dispose 幂等、root dispose 排水幂等(uid 0)、Service init disposer 恰好一次。
+- 补:errors 环逐出(1002→1000 保新)、非法日志级别回退 info、internal/set error 载体类型。
+
+测试 48 → **85**(双模式全绿)。TS 62+10 不变。

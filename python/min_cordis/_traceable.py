@@ -30,6 +30,8 @@ from __future__ import annotations
 import types
 from typing import Any, Callable
 
+from ._utils import FILTER
+
 __all__ = ["Tracker", "get_traceable", "TRACKER", "CALLER", "ORIGINAL", "SHADOW"]
 
 # Attribute keys used by the tracing machinery. Underscore names never enter
@@ -237,6 +239,13 @@ class _TraceableView(_DunderMixin):
             if name == CALLER:
                 return self._caller
             return self._target
+        if name == FILTER:
+            # Dispatch filtering hook (TS `thisArg[Context.filter]`); the
+            # raw instance carries it when it opts into scoped dispatch.
+            fn = getattr(self._target, FILTER, None)
+            if fn is None:
+                raise AttributeError(name)
+            return fn
         if name.startswith("_"):
             return getattr(self._target, name)
 
@@ -265,12 +274,12 @@ class _TraceableView(_DunderMixin):
         raise AttributeError(f"{type(self._target).__name__!r} object has no attribute {name!r}")
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_") and name in ("_caller", "_binding", "_target", "_tracker"):
-            object.__setattr__(self, name, value)
-            return
+        # TS set trap: writes of the tracker property, caller, and original
+        # are rejected (strict-mode TypeError); everything else lands on the
+        # target with the shadow receiver. No underscore whitelist — the
+        # constructor stores internals via object.__setattr__.
         tracker = self._tracker
         if name == tracker.property or name in _SPECIAL:
-            # TS rejects these writes through the proxy set trap.
             raise AttributeError(f"cannot set {name!r} on a traceable view")
         binding = self._binding
         dotted = f"{tracker.associate}.{name}" if tracker.associate else None
@@ -401,9 +410,6 @@ class _Overlay(_DunderMixin):
         return getattr(self._base, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_") and name in ("_base", "_props"):
-            object.__setattr__(self, name, value)
-            return
         if name in self._props:
             raise AttributeError(f"cannot set overlay prop {name!r}")
         tracker = self._tracker_of()
@@ -494,10 +500,12 @@ class _DerivedService(_DunderMixin):
         return getattr(self._base, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_") and name in ("_base", "_own"):
-            object.__setattr__(self, name, value)
-            return
-        # Own props land on the derived object (TS own-property semantics).
+        # TS: derived objects reject writes of the tracker property, caller,
+        # and original (proxy set trap returns false on the proto chain);
+        # other names become own properties.
+        tracker = getattr(self._root_target(), TRACKER, None)
+        if tracker is not None and (name == tracker.property or name in _SPECIAL):
+            raise AttributeError(f"cannot set {name!r} on a derived service")
         object.__getattribute__(self, "_own")[name] = value
 
     def __delattr__(self, name: str) -> None:

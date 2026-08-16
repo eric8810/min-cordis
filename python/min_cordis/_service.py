@@ -25,6 +25,7 @@ import types
 from typing import Any, Callable, ClassVar
 
 from ._traceable import Tracker, _DerivedService, _Overlay
+from ._utils import FILTER
 
 __all__ = ["Service", "Inject"]
 
@@ -104,10 +105,19 @@ class Service:
         self.name = name
         check = _find_own_function(type(self), "_check")
         self._init_hooks = collect_inject_hooks(self)
+        # Scoped-dispatch filter (TS Service[symbols.filter]): events
+        # dispatched with this service as the `this` argument reach only
+        # listeners on contexts sharing this service's isolation label.
+        setattr(self, FILTER, self._isolate_filter)
         # Register through the ctx facade: the effect must land on the
         # CALLING fiber (TS reaches the same via `ctx.reflect` returning a
         # view whose tracker rebinds `this.ctx` to the caller).
         ctx.provide(name, self, check)
+
+    def _isolate_filter(self, hook_ctx: Any) -> bool:
+        from ._context import _label_object
+
+        return _label_object(hook_ctx, self.name) is _label_object(self.ctx, self.name)
 
     def _extend(self, props: dict[str, Any] | None = None) -> Any:
         """Derive an extended instance overlaying ``props`` (``Service.extend``).

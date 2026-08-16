@@ -103,11 +103,11 @@ class ReflectService:
             assert fiber.store is not None
             fiber.store[name] = impl
             if fiber.state == FiberState.ACTIVE:
-                self.notify([name])
+                self.notify([name], ctx)
 
             async def unregister() -> None:
                 self.store.pop(label_obj, None)
-                fibers = self.notify([name])
+                fibers = self.notify([name], ctx)
                 await asyncio_gather_all(fibers)
                 if fiber.store is not None:
                     fiber.store.pop(name, None)
@@ -132,7 +132,16 @@ class ReflectService:
             raise RuntimeError(f'cannot set property "{name}" in multiple fibers')
         impl["value"] = value
 
-    def notify(self, names: list[str]) -> list[Any]:
+    def notify(self, names: list[str], source_ctx: Any = None) -> list[Any]:
+        """Re-evaluate every fiber that requires one of ``names``.
+
+        The isolation filter compares against the PROVIDING context's scope
+        (TS: notify's default filter reads ``this.ctx[symbols.isolate]``
+        through the traceable view, so the comparison base is the calling
+        context, not the root). Fibers outside the providing scope keep
+        their current dependency view.
+        """
+        source = source_ctx if source_ctx is not None else self.root
         fibers: list[Any] = []
         for runtime in list(self.root.registry.values()):
             for fiber in list(runtime.fibers):
@@ -140,17 +149,19 @@ class ReflectService:
                 for name in names:
                     if name not in fiber.inject:
                         continue
-                    if self._label_for(fiber.ctx, name) != self._label_for(self.root, name):
+                    if self._label_for(fiber.ctx, name) != self._label_for(source, name):
                         continue
                     updated = True
                     fiber._check_impl(name)
                 if updated:
                     fiber._refresh_deps()
                     fibers.append(fiber)
-        # Broadcast internal/service per changed name (C2 fix).
+        # Broadcast internal/service per changed name (C2 fix), resolved in
+        # the providing scope.
         for name in names:
-            impl = self._get_impl_for(self.root, name, strict=False)
-            self.root.events.emit("internal/service", name, None if impl is None else impl["value"])
+            impl = self._get_impl_for(source, name, strict=False)
+            value = None if impl is None else impl["value"]
+            self.root.events.emit("internal/service", name, value)
         return fibers
 
     def _current_ctx(self) -> "Context":
@@ -378,6 +389,10 @@ class Context:
         # fiber). Stored as its traceable view so ``ctx.logger('name')`` is
         # callable through the service invoke body.
         self.logger = get_traceable(self, LoggerService(self))
+        # Detach the built-in services' bootstrap effects so the root fiber
+        # stays immortal across a hypothetical root dispose (TS parity:
+        # ``this.fiber._disposables.clear()`` in the Context constructor).
+        self.fiber._disposables.clear()
 
     # ---------------------------------------------------------------- fiber
 

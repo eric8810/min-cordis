@@ -92,9 +92,20 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
   resolution; listeners may intercept (return a value / short-circuit) or
   delegate via `next()`. Root-context reads stay outside the get waterfall
   (TS parity).
+- **Notify is scope-relative**: dependency re-evaluation triggered by a
+  provide/unprovide compares isolation labels against the *providing*
+  context's scope (TS reaches the same through the traceable view rebinding
+  `this.ctx` inside reflect methods).
+- **Async-generator effects/bodies abort between segments** (TS epoch check):
+  the in-flight segment settles and is collected, later segments never run.
+- **Traceable views reject writes** of `ctx`/`_caller`/`_original` (TS proxy
+  set trap); derived services reject the same and accept other own props.
+- **The root fiber is immortal**: built-in service bootstrap effects are
+  detached in the Context constructor (TS parity), so `root.fiber.dispose()`
+  drains child plugins only and stays idempotent; root `uid` is `0` like TS.
 - `registry.delete` is fire-and-forget, exactly like the TS registry (the
   upstream snapshot test drains it with `sleep()`); covered by
-  `test_compare_snapshot`.
+  `test_snapshot_restores_after_registry_delete` with real nested listeners.
 - Object-source `ctx.mixin(instance, ...)` reproduces the upstream
   resolution quirk: plugin-context reads raise `cannot get property ...
   without inject`; root-context reads resolve to None. The upstream
@@ -103,11 +114,13 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
 - Attribute reads require an inject declared **somewhere on the context
   ancestor chain** (own ∪ ancestors), mirroring the TS fiber-chain walk;
   names nobody declared still fail loudly (`ctx.get` is the escape hatch).
+- Function plugins are always named (`__name__`); TS's
+  anonymous-inherits-ancestor display-name case has no Python equivalent.
 
 ## Run tests
 
 ```sh
 uv sync
-uv run pytest -q                    # 48 tests
+uv run pytest -q                    # 85 tests
 uv run pytest -q -W error::RuntimeWarning
 ```

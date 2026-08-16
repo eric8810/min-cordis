@@ -209,6 +209,7 @@ class Fiber:
         disposables: list[Callable[[], Any]] = []
         removing = False
         setup_task: asyncio.Task | None = None
+        aborting = {"flag": False}
 
         def collect(value: Any) -> None:
             if value is None:
@@ -227,6 +228,11 @@ class Fiber:
             if removing:
                 return None
             removing = True
+            # Signal the async-generator drain to stop after the current
+            # segment (TS `if (runner.epoch !== oldEpoch) return`): the
+            # in-flight __anext__ settles and is collected, later segments
+            # never run.
+            aborting["flag"] = True
 
             async def run_all() -> None:
                 # Setup barrier: wait for a still-settling async setup so its
@@ -254,7 +260,14 @@ class Fiber:
 
         if inspect.isasyncgen(result):
             async def drain_async_gen() -> None:
-                async for item in result:
+                iterator = result.__aiter__()
+                while True:
+                    if aborting["flag"]:
+                        return
+                    try:
+                        item = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        return
                     collect(item)
             setup_coro = drain_async_gen()
         elif inspect.isgenerator(result):
@@ -405,7 +418,17 @@ class Fiber:
         # is collected exactly like `ctx.effect` (F4 fix).
         gen = _iterate_effect(value)
         if inspect.isasyncgen(value):
-            async for item in value:
+            start_epoch = self._epoch
+            iterator = value.__aiter__()
+            while True:
+                if self._epoch != start_epoch:
+                    # Unload/reload raced the body: stop before advancing
+                    # (TS epoch check between generator segments).
+                    break
+                try:
+                    item = await iterator.__anext__()
+                except StopAsyncIteration:
+                    break
                 self._collect_one(item)
             return None
         if asyncio.iscoroutine(value):
@@ -488,7 +511,24 @@ class Fiber:
         return self.await_fiber().__await__()
 
     async def dispose(self) -> None:
-        await self.ctx.events._dispose_fiber_via_parent(self)
+        disposer = getattr(self, "_dispose_child", None)
+        if disposer is not None:
+            result = disposer()
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        if self.runtime is None:
+            # Root fiber: no parent disposer; drain its own ledger directly
+            # (TS root.fiber.dispose runs `_disposables` — child plugins
+            # unregister here). Idempotent: the cleared ledger makes a
+            # second dispose a no-op.
+            for dispose in self._disposables.clear():
+                try:
+                    result = dispose()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except BaseException as exc:
+                    self.on_error(exc)
 
     async def restart(self) -> None:
         fiber = self.ctx.fiber  # re-anchor: wrappers delegate lifecycle to the real fiber

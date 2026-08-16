@@ -161,10 +161,14 @@ class TestShadowCaller:
         injected: list = []
 
         def consumer(ctx, config):
-            return ctx.inject_plugins(
-                ["server"],
-                lambda c, cfg: injected.append(isinstance(c.server, Server)),
-            )
+            def check(c, cfg):
+                view = c.server
+                # isinstance alone passes for an untraced raw instance too
+                # (wrapper __class__ passthrough); the binding assertion is
+                # the discriminating check.
+                injected.append(isinstance(view, Server) and view._binding is c)
+
+            return ctx.inject_plugins(["server"], check)
 
         await root.plugin(Loader)
 
@@ -249,7 +253,18 @@ class TestFunctionalService:
                 callable_ = self.ctx.callable
                 return [callable_(), callable_.extend()()]
 
-        await root.plugin(Dependency)
+        instance: list = []
+        orig_init = Dependency.__init__
+
+        def capture_init(self, ctx, config=None):
+            orig_init(self, ctx, config)
+            instance.append(self)
+
+        Dependency.__init__ = capture_init
+        try:
+            await root.plugin(Dependency)
+        finally:
+            Dependency.__init__ = orig_init
         await root.plugin(Callable)
         await root.plugin(Outer)
 
@@ -262,6 +277,47 @@ class TestFunctionalService:
 
         assert len(result) == 2
         assert all(isinstance(item, Dependency) for item in result)
+        # identity: both views wrap the SAME registered instance (not fresh
+        # constructions), and remain traceable wrappers
+        from min_cordis._traceable import _TraceableView
+
+        assert all(isinstance(item, _TraceableView) for item in result)
+        assert all(item._root_target() is instance[0] for item in result)
+
+
+class TestViewWriteRejections:
+    """TS proxy set trap parity: ctx/caller/original writes are rejected."""
+
+    async def test_rejects_ctx_caller_original_writes(self, root):
+        class Foo(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "foo")
+
+        await root.plugin(Foo)
+        view = root.get("foo")
+        with pytest.raises(AttributeError):
+            view.ctx = root
+        with pytest.raises(AttributeError):
+            view._caller = root
+        with pytest.raises(AttributeError):
+            view._original = object()
+        with pytest.raises(AttributeError):
+            del view.ctx
+
+    async def test_rejects_writes_on_derived_services(self, root):
+        class Foo(Service):
+            def __init__(self, ctx, config=None):
+                super().__init__(ctx, "foo")
+
+        await root.plugin(Foo)
+        derived = root.get("foo")._extend({"x": 1})
+        with pytest.raises(AttributeError):
+            derived.ctx = root
+        with pytest.raises(AttributeError):
+            derived._caller = root
+        # plain own props still work
+        derived.x = 2
+        assert derived.x == 2
 
 
 class TestAssociation:
@@ -363,6 +419,7 @@ class TestAssociation:
                 return 42
 
         await root.plugin(Foo)
+        ran: list = []
 
         async def scope(ctx, config):
             session = ctx.foo.create_session()
@@ -378,10 +435,13 @@ class TestAssociation:
                 session2 = ctx2.foo.create_session()
                 assert isinstance(session2, Session)
                 assert session2.answer() == 42
+                ran.append("inner")
 
             await ctx.inject_plugins(["bar"], inner)
+            ran.append("scope")
 
         await root.inject_plugins(["foo"], scope)
+        assert ran == ["inner", "scope"]  # outer markers: both bodies ran
 
     async def test_associated_type_object_source_matches_upstream(self, root):
         # Upstream associate.spec #4: the inner `ctx.inject(['bar'], ...)`
@@ -420,9 +480,13 @@ class TestAssociation:
         # root-context read (no runtime): TS lenient lookup resolves undefined
         assert root.get("foo").session().bar is None
 
+        ran: list = []
+
         async def scope(ctx, config):
             session = ctx.foo.session()
             with pytest.raises(RuntimeError, match="without inject"):
                 _ = session.bar
+            ran.append(1)
 
         await root.inject_plugins(["foo"], scope)
+        assert ran == [1]  # outer marker: the scope body ran

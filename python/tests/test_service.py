@@ -12,7 +12,7 @@ import asyncio
 
 import pytest
 
-from min_cordis import Context, Inject, Service
+from min_cordis import Context, Inject, Service, Tracker
 
 
 @pytest.fixture
@@ -27,11 +27,30 @@ def root(errors):
 
 
 class _Counter:
+    """Effect-registering counter (TS tests/utils ``Counter``).
+
+    ``increase()`` registers an effect through the traceable view's
+    ``self.ctx`` — the discriminating contract of the "traceable effect"
+    tests: the effect must land on the fiber of the context the service was
+    ACCESSED from, so disposing an unrelated consumer fiber must leave the
+    increment in place (and the undo must not run).
+    """
+
     def __init__(self, ctx):
+        self._tracker = Tracker(associate="counter", property="ctx")
+        self.ctx = ctx
         self.value = 0
 
     def increase(self):
-        self.value += 1
+        def setup():
+            self.value += 1
+
+            def undo():
+                self.value -= 1
+
+            return undo
+
+        return self.ctx.effect(setup)
 
 
 async def test_pending_inject_blocked_by_service_init(root):

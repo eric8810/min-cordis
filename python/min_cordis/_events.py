@@ -249,15 +249,6 @@ class Events:
 
         return make_next(0)()
 
-    async def _dispose_fiber_via_parent(self, fiber: Any) -> None:
-        """Tear a child fiber down through the disposer registered on its parent."""
-        disposer = getattr(fiber, "_dispose_child", None)
-        if disposer is None:
-            return
-        result = disposer()
-        if asyncio.iscoroutine(result):
-            await result
-
 
 class EventsBusMixin:
     """Mixin identifying objects allowed as the dispatch ``this`` argument."""

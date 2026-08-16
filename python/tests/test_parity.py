@@ -243,12 +243,16 @@ async def test_c5_ctx_setattr_cannot_bypass_write_validation(ctx):
     ctx.custom = 1
     assert ctx.custom == 1
 
+    rejected: list = []
+
     def plugin(c, cfg):
         with pytest.raises(RuntimeError, match="cannot set property"):
             c.custom2 = 2
+        rejected.append(1)
 
     view = ctx.plugin(plugin)
     await view
+    assert rejected == [1]  # outer marker: the body really ran
 
     def provider(c, cfg):
         dispose = c.provide("svc", 1)

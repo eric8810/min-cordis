@@ -63,13 +63,11 @@ async def test_provide_inject_reload(ctx):
 
 
 async def test_service_requires_inject_for_attribute_read(ctx):
-    ctx.plugin(lambda c, cfg: c.provide("svc", 42))
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    # Not injected: attribute read must fail loudly.
+    view = ctx.plugin(lambda c, cfg: c.provide("svc", 42))
+    await view
+    assert view.state == FiberState.ACTIVE
     with pytest.raises(RuntimeError, match="without inject"):
         _ = ctx.svc
-    # ctx.get is the opportunistic read.
     assert ctx.get("svc") == 42
 
 

@@ -13,7 +13,7 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 ├── src\          TS 版:context/reflect/fiber/events/registry/service/utils/logger/index(9 文件)
 ├── tests\        上游 Cordis 测试套件(11 spec / 62 tests,来自 cordis-workspace HEAD)
 ├── test\         自写审计回归(10 tests)
-├── python\       Python 3.11+ 移植(min_cordis\ 8 模块 + tests\ 48 tests)
+├── python\       Python 3.11+ 移植(min_cordis\ 9 模块 + tests\ 85 tests)
 └── docs\         两份等价性审计报告(见下)
 ```
 
@@ -48,7 +48,7 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 - **`internal/get`/`internal/set` 瀑布钩子已落地**:插件 ctx 的服务读与属性写经事件总线分发,监听可拦截或 `next()` 透传;root 读不走 get 瀑布(TS 同)
 - **审计遗留项清零**:C4(store 改按 label 对象为键)、C5(`__setattr__` 路由 reflect.set 校验)已修;R3(delete fire-and-forget)经 test_compare_snapshot 验证与 TS 一致
 - 顺带修复:intercept 原型链语义、inject-config→intercept 条目、`_label_for` 死链、**祖先链 inject 可见性**(TS fiber 链 walk 的对应物:own ∪ 祖先 `_inject_requested`)
-- 测试 19 → **48**(`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1
+- 测试 19 → **85**(经两轮独立 agent 交叉审查修复:设计文档第九节;`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1、fiber 8/8、events 7/7、dispose 14/14(错误路径钉 Python 容制语义)、isolate 3/3、plugin 11/11、reflect 部分边界
 
 ## 怎么跑
 
@@ -61,7 +61,7 @@ npm test                              # 两者都跑
 
 # Python(uv 管理,环境已 sync)
 cd C:\Users\eric8810\repos\min-cordis\python
-uv run pytest -q                      # 48 tests
+uv run pytest -q                      # 85 tests
 ```
 
 注意:上游 `Inject` 装饰器是 Stage-3 原生装饰器,`experimentalDecorators` 必须**关闭**(vitest 3 + esbuild,不能用 vitest 4 的 oxc)。
