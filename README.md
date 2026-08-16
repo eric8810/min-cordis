@@ -86,6 +86,10 @@ Two suites:
 
 Node >= 22.19 (TypeScript is executed directly through `tsx`; the package ships `src/` as its export). Tests use vitest 3 — the upstream `Inject` decorator targets Stage-3 native decorators, so `experimentalDecorators` must stay off.
 
+## Python port
+
+[python/](python/) carries the same core to Python 3.11+ (asyncio), zero runtime dependencies, with the audit fixes carried over and a TS→Python translation map in its README.
+
 ## Provenance
 
 Source of record: `vendor/cordis` @ deepseek-harness (upstream cordis `4.0.0-rc.7`, commit `56b3d4f`, plus the fiber-lifecycle and lazy-config local patches logged in the vendor README). Trimming and fixes documented above; audit reports live in the harness repo under `docs/research/notes/`.
