@@ -5,8 +5,16 @@ Semantics ported from the TypeScript core (vendor/cordis + audit fixes):
 - ``PENDING -> LOADING -> ACTIVE -> ...`` state machine; a throwing
   ``internal/status`` observer no longer stalls dependency notification
   (per-callback containment).
-- Effects register disposers; teardown runs in reverse order.
+- Effects register disposers; teardown runs in reverse order. Async setups
+  are barrier-protected: a dispose that arrives before setup settles waits
+  for it (no leaked disposers).
+- Plugin bodies are effects: a returned disposer, list of disposers, or a
+  (async) generator yielding disposers is collected the same way.
 - Epoch = provider-fiber uids joined; any change reloads the dependent.
+  Constructor performs the initial dependency scan so providers mounted
+  BEFORE consumers still activate them.
+- A child fiber's disposal is an effect on its PARENT's ledger, so unloading
+  the parent tears down the whole subtree.
 - ``update()`` validates and resolves config *before* storing it, so a
   rejected update cannot poison later reloads.
 - Lifecycle mutation re-anchors to ``self.ctx.fiber``; the registry may hand
@@ -16,6 +24,7 @@ Semantics ported from the TypeScript core (vendor/cordis + audit fixes):
 from __future__ import annotations
 
 import asyncio
+import inspect
 from enum import IntEnum
 from typing import Any, Callable
 
@@ -63,6 +72,15 @@ def resolve_config(runtime: Any, config: Any) -> Any:
     return result
 
 
+def _iterate_effect(value: Any):
+    """Return an iterator over disposers for generator-like effects."""
+    if inspect.isgenerator(value) or inspect.isasyncgen(value):
+        return value
+    if hasattr(value, "__iter__") and not isinstance(value, (list, tuple, str, bytes, dict)):
+        return iter(value)
+    return None
+
+
 class Fiber:
     """Runtime instance of one plugin application."""
 
@@ -97,6 +115,7 @@ class Fiber:
         self._hooks: dict[str, DisposableList] = {}
         self._epoch: Any = INACTIVE
         self._store: dict[str, Any] = {}
+        self._effect_labels: list[tuple[str, int]] = []
         self.uid = None
 
         if runtime is not None:
@@ -127,8 +146,14 @@ class Fiber:
 
                 return drain()
 
-            registry.parent_fiber_disposables.push(dispose_child)
+            # F1 fix: the child's disposal is an effect on the PARENT fiber's
+            # ledger, so unloading the parent tears down the whole subtree.
+            parent.fiber._disposables.push(dispose_child)
             self._dispose_child = dispose_child
+            # F2 fix: initial dependency scan, so providers mounted before
+            # this fiber still satisfy its injects immediately.
+            for name in self.inject:
+                self._check_impl(name)
             self._refresh_deps()
         else:
             self.uid = 0
@@ -159,9 +184,16 @@ class Fiber:
     def effect(self, execute: Callable[[], Any], label: str = "anonymous") -> Callable[[], Any]:
         """Run ``execute`` now; collect the disposer(s) it yields.
 
-        Supports: a disposer callable, a list/tuple of disposers, or an async
-        callable returning any of those. Disposers run in reverse order when
-        the returned disposer (or the fiber) tears down.
+        Supported effect shapes (mirroring the TS core):
+        - a disposer callable
+        - a list/tuple of disposers
+        - a (sync or async) generator yielding disposers
+        - an async callable returning any of the above
+        - a coroutine resolving to any of the above
+
+        Disposers run in reverse order when the returned disposer (or the
+        fiber) tears down. A dispose that arrives while an async setup is
+        still settling waits for the setup first (setup barrier).
         """
         self.assert_active()
         if self.state == FiberState.UNLOADING:
@@ -169,22 +201,7 @@ class Fiber:
 
         disposables: list[Callable[[], Any]] = []
         removing = False
-
-        def run_disposers() -> Any:
-            nonlocal removing
-            if removing:
-                return None
-            removing = True
-            snapshot = list(disposables)
-            disposables.clear()
-
-            async def run_all() -> None:
-                for d in reversed(snapshot):
-                    result = d()
-                    if asyncio.iscoroutine(result):
-                        await result
-
-            return run_all()
+        setup_task: asyncio.Task | None = None
 
         def collect(value: Any) -> None:
             if value is None:
@@ -198,23 +215,73 @@ class Fiber:
                 return
             raise TypeError("Invalid effect")
 
+        def run_disposers() -> Any:
+            nonlocal removing
+            if removing:
+                return None
+            removing = True
+
+            async def run_all() -> None:
+                # Setup barrier: wait for a still-settling async setup so its
+                # disposer(s) are collected before teardown (F3 fix).
+                if setup_task is not None and not setup_task.done():
+                    try:
+                        await setup_task
+                    except BaseException as exc:
+                        self.on_error(exc)
+                snapshot = list(disposables)
+                disposables.clear()
+                for d in reversed(snapshot):
+                    result = d()
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            return run_all()
+
+        # Drive the setup: handle generators by draining them eagerly (each
+        # yielded disposer is registered as produced), and coroutines by a
+        # barrier task.
+        setup_coro: Any = None
+
         result = execute()
-        if asyncio.iscoroutine(result):
 
-            async def async_collect() -> None:
-                collect(await result)
-
-            # Fire-and-settle: collect as soon as the coroutine resolves; the
-            # disposer still runs on teardown.
-            task = asyncio.ensure_future(async_collect())
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-            remove = self._disposables.push(run_disposers)
+        if inspect.isasyncgen(result):
+            async def drain_async_gen() -> None:
+                async for item in result:
+                    collect(item)
+            setup_coro = drain_async_gen()
+        elif inspect.isgenerator(result):
+            for item in result:
+                collect(item)
+        elif asyncio.iscoroutine(result):
+            async def await_then_collect() -> None:
+                value = await result
+                gen = _iterate_effect(value)
+                if gen is None:
+                    collect(value)
+                    return
+                if inspect.isasyncgen(gen):
+                    async for item in gen:
+                        collect(item)
+                else:
+                    for item in gen:
+                        collect(item)
+            setup_coro = await_then_collect()
+        elif (gen := _iterate_effect(result)) is not None:
+            for item in gen:
+                collect(item)
         else:
             collect(result)
-            remove = self._disposables.push(run_disposers)
+
+        if setup_coro is not None:
+            setup_task = asyncio.ensure_future(setup_coro)
+            setup_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        remove = self._disposables.push(run_disposers)
+        self._effect_labels.append((label, id(disposables)))
 
         def dispose() -> Any:
             remove()
+            self._effect_labels = [e for e in self._effect_labels if e[1] != id(disposables)]
             return run_disposers()
 
         return dispose
@@ -222,10 +289,8 @@ class Fiber:
     # ------------------------------------------------------------- lifecycle
 
     def get_effects(self) -> list[str]:
-        return [label for label in self._labels()]
-
-    def _labels(self) -> list[str]:
-        return getattr(self, "_effect_labels", [])
+        """Labels of currently registered effects (flat list)."""
+        return [label for label, _ in self._effect_labels]
 
     def _get_state(self) -> FiberState:
         if self.uid is None:
@@ -314,31 +379,58 @@ class Fiber:
     async def _execute(self) -> Any:
         callback = self.runtime.callback
         instance_or_result = callback(self.ctx, self.config)
+        # A plugin body IS an effect: a returned disposer, list, or generator
+        # is collected exactly like `ctx.effect` (F4 fix).
+        gen = _iterate_effect(instance_or_result)
+        if inspect.isasyncgen(instance_or_result):
+            async for item in instance_or_result:
+                self._collect_one(item)
+            return None
         if asyncio.iscoroutine(instance_or_result):
             instance_or_result = await instance_or_result
-        # A plugin body IS an effect: a returned callable/list is collected as
-        # its disposer(s), exactly like `ctx.effect`.
+            gen = _iterate_effect(instance_or_result)
+        if gen is not None:
+            for item in gen:
+                self._collect_one(item)
+            return None
         if instance_or_result is not None:
-            self._collect_plugin_disposer(instance_or_result)
+            self._collect_one(instance_or_result)
         return instance_or_result
 
-    def _collect_plugin_disposer(self, value: Any) -> None:
-        if callable(value) or isinstance(value, (list, tuple)):
-            snapshot = [value] if callable(value) else list(value)
-            removing = {"done": False}
+    def _collect_one(self, value: Any) -> None:
+        if value is None:
+            return
+        # A FiberView (or Fiber) return is a mounted child plugin: its
+        # lifecycle is already owned by the parent ledger, not a disposer.
+        from ._registry import _FiberView
 
-            def run_disposers() -> Any:
-                if removing["done"]:
-                    return None
-                removing["done"] = True
-                async def run_all() -> None:
-                    for d in reversed(snapshot):
-                        result = d()
-                        if asyncio.iscoroutine(result):
-                            await result
-                return run_all()
+        if isinstance(value, (_FiberView, Fiber)):
+            return
+        if callable(value):
+            self._collect_plugin_disposer([value])
+            return
+        if isinstance(value, (list, tuple)):
+            self._collect_plugin_disposer(list(value))
+            return
+        raise TypeError("Invalid effect")
 
-            self._disposables.push(run_disposers)
+    def _collect_plugin_disposer(self, snapshot: list[Callable[[], Any]]) -> None:
+        removing = {"done": False}
+
+        def run_disposers() -> Any:
+            if removing["done"]:
+                return None
+            removing["done"] = True
+
+            async def run_all() -> None:
+                for d in reversed(snapshot):
+                    result = d()
+                    if asyncio.iscoroutine(result):
+                        await result
+
+            return run_all()
+
+        self._disposables.push(run_disposers)
 
     def _resolve_config(self, config: Any) -> Any:
         config = self.ctx.events._run_config_waterfall(self, config)

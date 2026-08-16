@@ -63,6 +63,7 @@ Runtime dependencies: **zero** (devDependency: tsx for running tests directly on
 4. **Rejected `update()` poisons later reloads** — config is validated and resolved *before* `_config` is touched; a rejected update leaves the previous config intact.
 5. **`EventsService._hooks` was a plain object** — now `Object.create(null)`; registering/dispatching `__proto__`/`constructor`/`toString` event names no longer crashes.
 6. **`parallel` reported itself as `emit`** on `internal/dispatch`; now reports `parallel` (the mode type is no longer a dead value).
+7. **`mixin` setter on a missing service** (defensive, undeclared upstream divergence): setting a mixin-forwarded property when the source service is `null`/`undefined` makes the proxy set-trap return `false` (a strict-mode `TypeError`, a silent no-op otherwise) instead of throwing `Reflect.set called on non-object`.
 
 ## Known limitations (inherited, documented)
 
@@ -72,6 +73,10 @@ These are core-design positions, not bugs — kept identical to upstream:
 - Same-fiber `ctx.set()` value swaps do not notify dependents (reload happens via provider lifecycle, not object identity).
 - `Service.check` predicates run on every dependency re-evaluation; a throwing predicate is contained and logged.
 - The traceable-proxy layer means `ctx.foo !== ctx.foo` for tracked services (fresh wrapper per read). Compare via `[symbols.original]` if needed.
+
+## Python port
+
+[python/](python/) carries the same core to Python 3.11+ (asyncio), zero runtime dependencies. The 2026-08-16 parity audit found and fixed all severe divergences (parent-child disposal ownership, provider-before-consumer activation, setup barriers, generator effects, emit sync-error propagation, per-fiber `internal/update`); `Service`/`@Inject`/traceable-proxy layers are not ported yet — see [docs/audit-python-parity-2026-08-16.md](docs/audit-python-parity-2026-08-16.md) for the exact capability boundary.
 
 ## Run
 

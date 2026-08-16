@@ -49,8 +49,9 @@ export class Logger {
  * framework containment paths.
  */
 export class LoggerService extends Service {
-  /** Contained error calls routed through this service (test/diagnostic ring). */
+  /** Contained error calls (bounded ring, newest kept; diagnostic surface). */
   readonly errors: unknown[][] = []
+  private static readonly ERROR_RING_LIMIT = 1000
 
   constructor(ctx: Context) {
     super(ctx, 'logger')
@@ -74,6 +75,9 @@ export class LoggerService extends Service {
   warn(...args: any[]) { this[Service.invoke]().warn(...args) }
   error(...args: any[]) {
     this.errors.push(args)
+    if (this.errors.length > LoggerService.ERROR_RING_LIMIT) {
+      this.errors.splice(0, this.errors.length - LoggerService.ERROR_RING_LIMIT)
+    }
     this[Service.invoke]().error(...args)
   }
 }

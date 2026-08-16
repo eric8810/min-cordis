@@ -26,10 +26,10 @@ class Events:
     # ------------------------------------------------------------- dispatch
 
     def _dispatch(self, mode: str, args: list[Any]) -> list[Callable]:
-        # Only an explicit filter-bearing first argument acts as the dispatch
-        # `this`; a bare context is not stripped.
+        # Mirror the TS rule: a non-string first argument is the dispatch
+        # `this` (also used for context filtering) and is stripped.
         first = args[0] if args else None
-        this_arg = first if (first is not None and _has_filter(first)) else None
+        this_arg = first if (first is not None and not isinstance(first, str)) else None
         if this_arg is not None:
             args = args[1:]
         name = args[0]
@@ -42,21 +42,23 @@ class Events:
         return [h["callback"] for h in selected]
 
     def emit(self, *args: Any) -> None:
-        """Dispatch synchronously; async listener errors go to the sink."""
+        """Dispatch synchronously.
+
+        Synchronous listener errors propagate to the caller (TS semantics);
+        only async listener rejections are routed to the error sink (E1 fix).
+        """
         cbs_and_args = self._dispatch_with_args("emit", list(args))
         for cb, rest in cbs_and_args:
-            try:
-                result = cb(*rest)
-            except BaseException as exc:
-                self._ctx.on_error(exc)
-                continue
+            result = cb(*rest)
             if asyncio.iscoroutine(result):
                 task = asyncio.ensure_future(result)
                 task.add_done_callback(lambda t: self._ctx.on_error(t.exception()) if (not t.cancelled() and t.exception()) else None)
 
     def _dispatch_with_args(self, mode: str, args: list[Any]) -> list[tuple[Callable, list[Any]]]:
+        # Mirror the TS rule: a non-string first argument is the dispatch
+        # `this` (also used for context filtering) and is stripped.
         first = args[0] if args else None
-        this_arg = first if (first is not None and _has_filter(first)) else None
+        this_arg = first if (first is not None and not isinstance(first, str)) else None
         if this_arg is not None:
             args = args[1:]
         name = args[0]
@@ -122,16 +124,35 @@ class Events:
 
     # ------------------------------------------------------------- register
 
-    def on(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
-        """Register a listener owned by the current fiber."""
+    def on(self, name: Any, listener: Callable, options: bool | dict | None = None, ctx: Any = None) -> Callable[[], None]:
+        """Register a listener owned by the current fiber.
+
+        ``internal/update`` listeners registered without ``global`` are
+        attached to the OWNING fiber's per-fiber hook list (E2 fix), so each
+        fiber's ``update()`` runs only its own hooks.
+        """
         if isinstance(options, bool):
             options = {"prepend": options}
         options = options or {}
-        self._ctx.fiber.assert_active()
+        owner = ctx or self._ctx
+        owner.fiber.assert_active()
+
+        label = f"ctx.on({name!r})"
+
+        if name == "internal/update" and not options.get("global"):
+            fiber = owner.fiber
+            per_fiber = fiber._hooks.setdefault("internal/update", [])
+            per_fiber.append(listener)
+
+            def unregister_local() -> None:
+                if listener in per_fiber:
+                    per_fiber.remove(listener)
+
+            fiber._disposables.push(unregister_local)
+            return unregister_local
 
         hooks = self._hooks.setdefault(name, [])
-        hook = {"ctx": self._ctx, "callback": listener, **options}
-        label = f"ctx.on({name!r})"
+        hook = {"ctx": owner, "callback": listener, **options}
 
         def register() -> Callable[[], None]:
             hooks.append(hook) if not options.get("prepend") else hooks.insert(0, hook)
@@ -142,12 +163,13 @@ class Events:
 
             return unregister
 
-        return self._ctx.fiber.effect(register, label)
+        return owner.fiber.effect(register, label)
 
-    def once(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
+    def once(self, name: Any, listener: Callable, options: bool | dict | None = None, ctx: Any = None) -> Callable[[], None]:
+        owner = ctx or self._ctx
         hooks = self._hooks.setdefault(name, [])
         options_map = {"prepend": options} if isinstance(options, bool) else (options or {})
-        hook: dict = {"ctx": self._ctx, "callback": None, **options_map}
+        hook: dict = {"ctx": owner, "callback": None, **options_map}
 
         def wrapped(*args: Any) -> Any:
             if hook in hooks:
@@ -160,7 +182,7 @@ class Events:
         else:
             hooks.append(hook)
         # Tie the registration to the fiber so unloading removes it too.
-        self._ctx.fiber._disposables.push(lambda: hooks.remove(hook) if hook in hooks else None)
+        owner.fiber._disposables.push(lambda: hooks.remove(hook) if hook in hooks else None)
 
         def unregister() -> None:
             if hook in hooks:
@@ -206,13 +228,23 @@ class Events:
         return make_next(0)()
 
     def _run_update_waterfall(self, fiber: Any, resolved: Any, no_save: bool, apply: Callable[[], Any]) -> Any:
-        handlers = self._hooks.get("internal/update") or []
+        # Per-fiber hooks first (E2 fix): only the fiber being updated runs
+        # its own `internal/update` hooks, then any global ones, then apply.
+        handlers = list(fiber._hooks.get("internal/update") or [])
+        global_handlers = [h["callback"] for h in (self._hooks.get("internal/update") or []) if h.get("global")]
 
         def make_next(index: int) -> Callable[[], Any]:
             def next_cb() -> Any:
                 if index < len(handlers):
-                    return handlers[index]["callback"](resolved, no_save, make_next(index + 1))
+                    # Handler return values pass through untouched (TS
+                    # semantics): a coroutine returned by a sync handler is
+                    # the caller's to await — the chain ran exactly once.
+                    return handlers[index](resolved, no_save, make_next(index + 1))
+                if index - len(handlers) < len(global_handlers):
+                    gi = index - len(handlers)
+                    return global_handlers[gi](resolved, no_save, make_next(index + 1))
                 return apply()
+
             return next_cb
 
         return make_next(0)()

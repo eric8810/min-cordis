@@ -124,6 +124,10 @@ class ReflectService:
                 if updated:
                     fiber._refresh_deps()
                     fibers.append(fiber)
+        # Broadcast internal/service per changed name (C2 fix).
+        for name in names:
+            impl = self._get_impl_for(self.root, name, strict=False)
+            self.root.events.emit("internal/service", name, None if impl is None else impl["value"])
         return fibers
 
     def _current_ctx(self) -> "Context":
@@ -256,10 +260,10 @@ class Context:
         return self.registry.inject(deps, callback, parent=self)
 
     def on(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
-        return self.events.on(name, listener, options)
+        return self.events.on(name, listener, options, ctx=self)
 
     def once(self, name: Any, listener: Callable, options: bool | dict | None = None) -> Callable[[], None]:
-        return self.events.once(name, listener, options)
+        return self.events.once(name, listener, options, ctx=self)
 
     async def parallel(self, *args: Any) -> None:
         await self.events.parallel(*args)
