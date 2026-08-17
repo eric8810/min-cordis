@@ -117,10 +117,37 @@ Intentional deviations (documented in [docs/design-python-traceable.md](../docs/
 - Function plugins are always named (`__name__`); TS's
   anonymous-inherits-ancestor display-name case has no Python equivalent.
 
+## Examples
+
+[`examples/`](examples/) holds reference applications built **on** the core —
+the kernel stays minimal, examples show how its pieces compose.
+
+**[examples/agent_loop.py](examples/agent_loop.py)** — a basic agent loop
+(perceive → think → act → observe) assembled strictly through the plugin
+machinery: `LLMClient` as the `llm` service, `AgentLoop` as the `agent`
+service with `inject = ["llm"]` gating (load order between the two plugins
+never matters), `ToolSpec` tools, and `agent/step` / `agent/tool` events
+over the bus:
+
+```python
+from min_cordis import Context
+from examples.agent_loop import AgentLoop, LLMClient, ToolSpec  # demo layout: examples/ dir
+
+root = Context()
+await root.plugin(MyLLM)                    # subclass of LLMClient
+await root.plugin(AgentLoop, {"tools": [weather], "max_steps": 16})
+answer = await root.get("agent").run("weather in Oslo?")
+```
+
+Run the scripted demo (no network) with `uv run python examples/demo.py`;
+its 11 tests run with the regular suite and document the failure modes
+(`max_steps` exhaustion, cooperative `stop()`, fail-fast when bypassing
+`ctx.plugin` assembly). See [examples/README.md](examples/README.md).
+
 ## Run tests
 
 ```sh
 uv sync
-uv run pytest -q                    # 85 tests
+uv run pytest -q                    # 96 tests (85 core + 11 example)
 uv run pytest -q -W error::RuntimeWarning
 ```
