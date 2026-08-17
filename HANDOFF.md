@@ -13,8 +13,8 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 ├── src\          TS 版:context/reflect/fiber/events/registry/service/utils/logger/index(9 文件)
 ├── tests\        上游 Cordis 测试套件(11 spec / 62 tests,来自 cordis-workspace HEAD)
 ├── test\         自写审计回归(10 tests)
-├── python\       Python 3.11+ 移植(min_cordis\ 9 模块 + tests\ 85 tests)
-└── docs\         两份等价性审计报告(见下)
+├── python\       Python 3.11+ 移植(min_cordis\ 9 模块核心 + examples\ 应用示例 + tests\ 85 核心测试;example 自带 11 测试)
+└── docs\         审计/设计文档 11 份:TS·Python 等价性审计、上游差距审计、design-python-traceable、**design-rust-port(v4 范式路线)**、四份审阅存档(round1/2 × sol/deepseek)、三份调研存档(async/生态/热更新案例)
 ```
 
 相关但**不属于本仓库**:
@@ -48,7 +48,8 @@ C:\Users\eric8810\repos\min-cordis     ← 本项目(独立 git 仓库)
 - **`internal/get`/`internal/set` 瀑布钩子已落地**:插件 ctx 的服务读与属性写经事件总线分发,监听可拦截或 `next()` 透传;root 读不走 get 瀑布(TS 同)
 - **审计遗留项清零**:C4(store 改按 label 对象为键)、C5(`__setattr__` 路由 reflect.set 校验)已修;R3(delete fire-and-forget)经 test_compare_snapshot 验证与 TS 一致
 - 顺带修复:intercept 原型链语义、inject-config→intercept 条目、`_label_for` 死链、**祖先链 inject 可见性**(TS fiber 链 walk 的对应物:own ∪ 祖先 `_inject_requested`)
-- 测试 19 → **85**(经两轮独立 agent 交叉审查修复:设计文档第九节;`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1、fiber 8/8、events 7/7、dispose 14/14(错误路径钉 Python 容制语义)、isolate 3/3、plugin 11/11、reflect 部分边界
+- **agent loop 已整理为应用示例**(`python/examples/`,**不在核心包内**):`agent_loop.py`(`LLMClient` provide="llm" + `ToolSpec` + `AgentLoop` provide="agent"、**`inject=["llm"]` 门控**、`(ctx, config)` 构造、`_init` 在 fiber ACTIVE 前 await 并绑定 llm)、`demo.py`(可运行演示:先载 agent 后载 llm 验证门控、audit 插件经事件总线观察、异步工具往返;`uv run python examples/demo.py`)、`test_agent_loop.py`(11 测试,与 tests\ 一起跑,pyproject testpaths=["tests","examples"])。核心包 min_cordis 回到 9 模块纯内核。工具错误/未知工具以 `error:` 结果回喂模型不崩环;`max_steps` 预算 + `stop()` 协作取消;`agent/step`、`agent/tool` 事件经 `ctx.emit` 分发,监听随 fiber 卸载;绕过 plugin 构造时 `run()` fail-fast。详见 `python/examples/README.md`
+- 测试 19 → **96**(85 核心 + 11 示例;`-W error::RuntimeWarning` 干净);上游语义面:shadow 4/4、invoke 2/2、associate 4/5(#4 死代码除外)、service 5/5、decorator 1/1、fiber 8/8、events 7/7、dispose 14/14(错误路径钉 Python 容制语义)、isolate 3/3、plugin 11/11、reflect 部分边界
 
 ## 怎么跑
 
@@ -61,7 +62,8 @@ npm test                              # 两者都跑
 
 # Python(uv 管理,环境已 sync)
 cd C:\Users\eric8810\repos\min-cordis\python
-uv run pytest -q                      # 85 tests
+uv run pytest -q                      # 96 tests(85 核心 tests\ + 11 示例 examples\)
+uv run python examples/demo.py        # agent loop 可运行演示(无网络)
 ```
 
 注意:上游 `Inject` 装饰器是 Stage-3 原生装饰器,`experimentalDecorators` 必须**关闭**(vitest 3 + esbuild,不能用 vitest 4 的 oxc)。
@@ -78,8 +80,9 @@ uv run pytest -q                      # 85 tests
 核心移植**全部完结**;上游差距审计(2026-08-16,gpt-5.6-sol)的 Top 2 行动也已落实:**reentrant 对抗性生命周期测试**(27 个,带动 effect 机制升级为分支的 EffectRecord 处置契约:执行/清理双通道、全量 LIFO、恰好一次处置任务、stale 代际防毒化)+ **内部扩展点钉子**(7 个:internal/dispatch/config/update/status)。TS 96+10、Python 85 双模式全绿。剩余:
 
 1. (可选,低价值)采纳 `29581f6` 免 bind dispatch
-2. Go/Rust 移植(命题已由 Python 验证成立,纯工程活)
-3. Python 侧同步 EffectRecord 处置契约(全量 LIFO/AggregateError/处置任务同一性)——TS 已升级,Python `_fiber.py` 还是旧链,两版语义面在此处不一致
+2. Rust 移植——**设计 v4 定稿,范式路线**([docs/design-rust-port.md](docs/design-rust-port.md),2026-08-17):用户裁决**范式移植而非一比一**(五支柱:插件装配单元/fiber 生命周期容器/类型键注册表/五模式事件总线/依赖门控热重载),Rust 惯用表达,验收=范式契约测试自证(~35-45 个,不锚 TS spec)。经 gpt-5.6-sol+deepseek-v4-pro 两轮审阅(一比一路线的 v1-v3 与四份审阅存档保留)+ 两份生态调研(tokio 官方 + Bevy/tower/shaku/Tauri 先例):BoxFuture 手写 ABI、watch 终态多观察者、CancellationToken 取消货币、Handle 注入、泛型事件+内部 Any 擦除、TypeId 注册表+显式 key 多实例、闭包身份改显式 PluginId、错误不 Clone(Arc 共享)。热重载无生态先例=差异化能力,自建反向依赖索引。里程碑 M1 EventBus → M2 Fiber/Registry/重载 → M3 agent → M4 可选。下一步按 v4 实现
+3. Go 移植(命题已由 Python 验证成立,纯工程活)
+4. Python 侧同步 EffectRecord 处置契约(全量 LIFO/AggregateError/处置任务同一性)——TS 已升级,Python `_fiber.py` 还是旧链,两版语义面在此处不一致;**Rust 版直接按新契约做**(设计文档契约 3)
 
 ## 会话历史摘要(需要细节时查)
 

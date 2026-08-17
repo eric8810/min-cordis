@@ -76,7 +76,9 @@ These are core-design positions, not bugs — kept identical to upstream:
 
 ## Python port
 
-[python/](python/) carries the same core to Python 3.11+ (asyncio), zero runtime dependencies. The 2026-08-16 parity audit found and fixed all severe divergences (parent-child disposal ownership, provider-before-consumer activation, setup barriers, generator effects, emit sync-error propagation, per-fiber `internal/update`); `Service`/`@Inject`/traceable-proxy layers are not ported yet — see [docs/audit-python-parity-2026-08-16.md](docs/audit-python-parity-2026-08-16.md) for the exact capability boundary.
+[python/](python/) carries the same core to Python 3.11+ (asyncio), zero runtime dependencies. The 2026-08-16 parity audit found and fixed all severe divergences (parent-child disposal ownership, provider-before-consumer activation, setup barriers, generator effects, emit sync-error propagation, per-fiber `internal/update`); the `Service`/`@Inject`/traceable-caller layers are ported too — see [docs/audit-python-parity-2026-08-16.md](docs/audit-python-parity-2026-08-16.md) and python/README.md's TS→Python translation map.
+
+[python/examples/agent_loop.py](python/examples/agent_loop.py) is the reference application: a basic agent loop (perceive → think → act → observe) assembled strictly through the plugin machinery — services, inject gating, fiber-owned listeners, and the event bus. Runnable demo: `uv run python examples/demo.py` from python/.
 
 ## Run
 
@@ -90,10 +92,6 @@ Two suites:
 - `test/core.test.ts` — regression tests written for each audit fix above.
 
 Node >= 22.19 (TypeScript is executed directly through `tsx`; the package ships `src/` as its export). Tests use vitest 3 — the upstream `Inject` decorator targets Stage-3 native decorators, so `experimentalDecorators` must stay off.
-
-## Python port
-
-[python/](python/) carries the same core to Python 3.11+ (asyncio), zero runtime dependencies, with the audit fixes carried over and a TS→Python translation map in its README.
 
 ## Provenance
 
