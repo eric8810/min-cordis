@@ -1,0 +1,14 @@
+[package]
+name = "min-cordis-agent"
+description = "Agent-loop example crate on top of min-cordis (LLM trait, ToolSpec, cancellation, event observation)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+min-cordis = { path = "../min-cordis" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
