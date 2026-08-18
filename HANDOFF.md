@@ -1,6 +1,8 @@
 # min-cordis Handoff
 
 > 2026-08-16。给新会话的完整交接:项目是什么、怎么来的、现状、怎么跑、下一步。读完这份即可继续开发,不需要回放原会话。
+>
+> **2026-08-18 更新**:Rust 移植已按 design-rust-port / design-min-agent 完成(内核五支柱 + agent 框架 + TUI,测试全绿),并**独立成仓 [rutis](https://github.com/eric8810/rutis)**(crate 名 `rutis` / `rutis-agent`,crates.io 名已确认可用)。本仓库保留 TS/Python 版与全部设计文档;下文涉及 `rust/` 的段落为历史记录。
 
 ## 一句话
 
